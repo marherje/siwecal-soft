@@ -11,5 +11,6 @@ This product includes software developed as part of the SiWECAL
 testbeam analysis effort within the key4hep ecosystem.
 
 Portions of this project are derived from or interoperate with:
-  - SiWECAL-TB-analysis (CALICE/SiW-ECAL testbeam analysis)
+  - SiWECAL-TB-analysis (CALICE/SiW-ECAL testbeam analysis, https://github.com/SiWECAL-TestBeam/SiWECAL-TB-analysis):
+    the DAQ decoding (SLB frame decoder, raw decoder) and the pedestal/MIP calibration are based on it
   - key4hep (https://key4hep.github.io/)
