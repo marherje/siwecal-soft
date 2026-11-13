@@ -1,0 +1,219 @@
+/*
+ * EcalShowerVariables: per-event particle-discrimination variables for the
+ * SiW-ECAL. Strict 1->1 functional Transformer: one input CalorimeterHit
+ * collection (one event) -> one Cluster carrying the shower variables.
+ *
+ * The physics lives in EcalShowerVars.h (a C++ port of metrics.py). This
+ * algorithm only marshals the EDM4hep hits into plain vectors, calls
+ * computeEventVars, and flattens the result into Cluster::shapeParameters.
+ *
+ * shapeParameters layout (canonical, see EcalShowerVars.h):
+ *   [ scalarNames()                       ]   base variables
+ *   [ hits_per_layer[n] | energy_per_layer[n] | weighte_per_layer[n] ]
+ *   [ <mipPrefix>_<scalarNames()> ... ]       one block per MIP-cut threshold
+ * The matching shapeParameterNames vector is attached as collection metadata.
+ */
+#include "k4FWCore/MetaDataHandle.h"
+#include "k4FWCore/Transformer.h"
+
+#include "edm4hep/CalorimeterHitCollection.h"
+#include "edm4hep/ClusterCollection.h"
+
+#include "DDSegmentation/BitFieldCoder.h"
+
+#include "Gaudi/Property.h"
+
+#include "siwecal/EcalShowerVars.h"
+#include "siwecal/PadMapGeometry.h"  // SlabGeometry: the ONE tungsten geometry
+
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace k4siwecal;
+
+namespace {
+/// Branch-name-safe prefix for a MIP threshold: 0.5 -> "mip05", 1.0 -> "mip1".
+std::string mipPrefix(float thr) {
+  std::string s = std::to_string(thr);          // "0.500000"
+  s = s.substr(0, s.find('.') + 2);             // "0.5"
+  s.erase(std::remove(s.begin(), s.end(), '.'), s.end());  // "05"
+  if (!s.empty() && s.back() == '0' && s.size() > 1) s.pop_back();  // "05"->"05","10"->"1"
+  return "mip" + s;
+}
+
+void appendScalars(std::vector<float>& flat, const EventVars& v) {
+  flat.insert(flat.end(),
+              {v.nhit, v.zbary, v.energy, v.mip_likeness, v.weighte, v.bar_x, v.bar_y, v.bar_r,
+               v.moliere, v.transverse_rms, v.is_shower, v.shower_start, v.shower_max, v.shower_end,
+               v.shower_start_10, v.shower_end_10, v.shower_length, v.first_layer, v.last_layer,
+               v.n_layers_hit, v.e_over_nhit, v.shower_onset, v.n_layers_before_onset,
+               v.fractal_dimension, v.barxy_min_border_distance});
+}
+}  // namespace
+
+struct EcalShowerVariables final
+    : k4FWCore::Transformer<edm4hep::ClusterCollection(const edm4hep::CalorimeterHitCollection&)> {
+  EcalShowerVariables(const std::string& name, ISvcLocator* svcLoc)
+      : Transformer(name, svcLoc, KeyValues("InputCaloHits", {"ECalHits"}),
+                    KeyValues("OutputClusters", {"ECalPid"})) {}
+
+  StatusCode initialize() override {
+    m_coder = std::make_unique<dd4hep::DDSegmentation::BitFieldCoder>(m_cellIDEncoding.value());
+
+    // The sampling weights come from the SAME SlabGeometry the event builder
+    // uses for hit_w_energy/hit_X0, not from a second list living here. They
+    // used to be an independent literal in this file, and an independent list
+    // is an independent chance to be wrong: `weighte` and `hit_w_energy` are
+    // the same quantity summed at different stages, so they must not be able to
+    // disagree. WThicknesses stays as an explicit escape hatch (empty = use the
+    // geometry).
+    const k4siwecal::SlabGeometry geom = m_slabZFile.value().empty()
+                                             ? k4siwecal::SlabGeometry::defaults()
+                                             : k4siwecal::SlabGeometry::fromYamlFile(m_slabZFile.value());
+    m_wOverX0.clear();
+    if (m_wThicknesses.value().empty()) {
+      for (int slab = 0; slab < m_nLayers.value(); ++slab) m_wOverX0.push_back(geom.slabWOverX0(slab));
+    } else {
+      if (static_cast<int>(m_wThicknesses.value().size()) != m_nLayers.value())
+        return error() << "WThicknesses length != NLayers" << endmsg, StatusCode::FAILURE;
+      for (double w : m_wThicknesses.value()) m_wOverX0.push_back(w / m_wX0.value());
+    }
+
+    // appendScalars() and scalarNames() are two hand-maintained lists that have
+    // to stay in lockstep -- nothing in the type system ties them together, and
+    // a mismatch would not crash, it would silently shift every column label
+    // past the gap. Check it once here instead.
+    std::vector<float> probe;
+    appendScalars(probe, EventVars{});
+    if (probe.size() != scalarNames().size())
+      return error() << "appendScalars() writes " << probe.size() << " values but scalarNames() has "
+                     << scalarNames().size() << " entries" << endmsg,
+             StatusCode::FAILURE;
+
+    // Build and publish the shapeParameterNames metadata.
+    m_paramNames = buildParamNames();
+    m_shapeParamNames.put(m_paramNames);
+    return StatusCode::SUCCESS;
+  }
+
+  edm4hep::ClusterCollection operator()(
+      const edm4hep::CalorimeterHitCollection& hitColl) const override {
+    edm4hep::ClusterCollection clusters;
+    auto cluster = clusters.create();
+
+    std::vector<int> slab;
+    std::vector<float> energy, x, y;
+    slab.reserve(hitColl.size());
+    energy.reserve(hitColl.size());
+    x.reserve(hitColl.size());
+    y.reserve(hitColl.size());
+    for (const auto& hit : hitColl) {
+      slab.push_back(static_cast<int>(m_coder->get(hit.getCellID(), "slab")));
+      energy.push_back(hit.getEnergy());
+      x.push_back(hit.getPosition().x);
+      y.push_back(hit.getPosition().y);
+      cluster.addToHits(hit);
+    }
+
+    const ShowerThresholds thr{static_cast<float>(m_showerEThreshold.value()),
+                               static_cast<float>(m_showerMaxMin.value()),
+                               static_cast<float>(m_showerStartFrac.value()),
+                               static_cast<float>(m_showerCoreRadiusMm.value()),
+                               m_showerOnsetMinNhit.value(),
+                               m_showerOnsetMinConsecutive.value(),
+                               static_cast<float>(m_activeHalfSizeX.value()),
+                               static_cast<float>(m_activeHalfSizeY.value())};
+    const EventVars base = computeEventVars(slab, energy, x, y, m_wOverX0, m_nLayers.value(),
+                                            m_showerProfile.value(), thr,
+                                            m_moliereContainment.value());
+
+    cluster.setEnergy(base.energy);
+    cluster.setPosition({base.bar_x, base.bar_y, 0.f});
+
+    std::vector<float> flat;
+    appendScalars(flat, base);
+    flat.insert(flat.end(), base.hits_per_layer.begin(), base.hits_per_layer.end());
+    flat.insert(flat.end(), base.energy_per_layer.begin(), base.energy_per_layer.end());
+    flat.insert(flat.end(), base.weighte_per_layer.begin(), base.weighte_per_layer.end());
+
+    // MIP-cut variants: re-filter hits by energy >= threshold, scalars only.
+    for (float mip : m_mipThresholds.value()) {
+      std::vector<int> fs;
+      std::vector<float> fe, fx, fy;
+      for (std::size_t i = 0; i < slab.size(); ++i)
+        if (energy[i] >= mip) {
+          fs.push_back(slab[i]);
+          fe.push_back(energy[i]);
+          fx.push_back(x[i]);
+          fy.push_back(y[i]);
+        }
+      const EventVars vv = computeEventVars(fs, fe, fx, fy, m_wOverX0, m_nLayers.value(),
+                                            m_showerProfile.value(), thr,
+                                            m_moliereContainment.value());
+      appendScalars(flat, vv);
+    }
+
+    for (float value : flat) cluster.addToShapeParameters(value);
+    return clusters;
+  }
+
+  /// Canonical shapeParameterNames matching the flat layout above.
+  std::vector<std::string> buildParamNames() const {
+    std::vector<std::string> names = scalarNames();
+    for (const auto& block : perLayerNames())
+      for (int i = 0; i < m_nLayers.value(); ++i) names.push_back(block + "_" + std::to_string(i));
+    for (float mip : m_mipThresholds.value()) {
+      const std::string pre = mipPrefix(mip);
+      for (const auto& s : scalarNames()) names.push_back(pre + "_" + s);
+    }
+    return names;
+  }
+
+  Gaudi::Property<int> m_nLayers{this, "NLayers", 15, "Number of ECAL layers"};
+  // double (not float) to bit-match metrics.py's float64 W/X0 weights.
+  Gaudi::Property<std::string> m_slabZFile{
+      this, "SlabZFile", "",
+      "slab_z_positions.yml; empty = the compiled-in geometry defaults. Same file/defaults the event builder "
+      "uses, so weighte and hit_w_energy always share one tungsten geometry."};
+  Gaudi::Property<std::vector<double>> m_wThicknesses{
+      this, "WThicknesses", {},
+      "Per-slab tungsten thickness [mm]. Empty (the default) = take it from the slab geometry, which is what "
+      "you want; set it only to deliberately override the geometry."};
+  Gaudi::Property<double> m_wX0{this, "WX0", k4siwecal::kWX0Mm, "Tungsten radiation length [mm]"};
+  Gaudi::Property<std::string> m_showerProfile{this, "ShowerProfile", "nhit",
+                                               "Profile for shower flag: nhit|sume|weighte"};
+  Gaudi::Property<float> m_showerEThreshold{this, "ShowerEThreshold", 5.0f, ""};
+  Gaudi::Property<float> m_showerMaxMin{this, "ShowerMaxMin", 10.0f, ""};
+  Gaudi::Property<float> m_showerStartFrac{this, "ShowerStartFrac", 0.1f, ""};
+  Gaudi::Property<float> m_showerCoreRadiusMm{
+      this, "ShowerCoreRadiusMm", 30.0f,
+      "is_shower: radius around (bar_x,bar_y) hits must fall within to count toward a layer's local density"};
+  Gaudi::Property<int> m_showerOnsetMinNhit{
+      this, "ShowerOnsetMinNhit", 4,
+      "is_shower: core hits in one layer for that layer to count as dense. A through-going MIP gives 1-2"};
+  Gaudi::Property<int> m_showerOnsetMinConsecutive{
+      this, "ShowerOnsetMinConsecutive", 2,
+      "is_shower: consecutive dense layers that declare the shower onset. 2 rejects a single-layer "
+      "delta-ray fluctuation"};
+  Gaudi::Property<float> m_activeHalfSizeX{
+      this, "ActiveHalfSizeX", 89.09f,
+      "barxy_min_border_distance: half-size of the active area in x [mm] (outer pad centre + half pad)"};
+  Gaudi::Property<float> m_activeHalfSizeY{
+      this, "ActiveHalfSizeY", 89.09f, "barxy_min_border_distance: same in y [mm]"};
+  Gaudi::Property<double> m_moliereContainment{this, "MoliereContainment", 0.90, ""};
+  Gaudi::Property<std::vector<float>> m_mipThresholds{this, "MipThresholds", {0.5f, 1.0f}, ""};
+  Gaudi::Property<std::string> m_cellIDEncoding{
+      this, "CellIDEncoding", "system:8,slab:8,chip:16,channel:8,sca:8", ""};
+
+private:
+  std::unique_ptr<dd4hep::DDSegmentation::BitFieldCoder> m_coder;
+  std::vector<double> m_wOverX0;
+  std::vector<std::string> m_paramNames;
+  // Frame-level metadata: the names matching the flat shapeParameters layout.
+  // Read downstream to interpret Cluster::shapeParameters by name.
+  k4FWCore::MetaDataHandle<std::vector<std::string>> m_shapeParamNames{
+      "ECalPid_shapeParameterNames", Gaudi::DataHandle::Writer};
+};
+
+DECLARE_COMPONENT(EcalShowerVariables)

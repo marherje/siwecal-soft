@@ -1,0 +1,774 @@
+# SiW-ECAL TB2026CERN Analysis Suite
+
+End-to-end analysis tools for the **SiW-ECAL** (Silicon-Tungsten Electromagnetic
+Calorimeter) prototype tested at the CERN **TB2026CERN** beam test. The suite
+takes the decoded raw data, builds physics events, validates them, and lets you
+inspect them interactively — three packages that share one geometry, one
+calibration and one configuration file.
+
+The whole reconstruction is **C++/Gaudi** (`gaudi_source`), driven on the batch
+farm by one Condor DAG. `siwecal_eventbuilder/` is the ORIGINAL Python event
+builder: it is **not** what the pipeline runs — see "Two event builders" below.
+
+```
+ RAW  <run>_raw.bin_NNNN                      <-- read-only, under Data/rundata/
+        │
+        ▼  STAGE 1 · decode — one k4run PER raw chunk, in parallel + health check
+ ┌─────────────────────────┐
+ │  gaudi_source (C++)     │  ───────────────►  Data/rundata_converted_gaudi/
+ │  EcalRawDecoder         │                      <run>/chunks/chunk_NNNN.root
+ └─────────────────────────┘                      (siwecaldecoded tree)
+        │
+        ▼  STAGE 2 · event building — one k4run chaining the chunks (no merge)
+ ┌─────────────────────────┐
+ │  gaudi_source (C++)     │  ───────────────►  Reconstruction/<run>/
+ │  EcalEventBuilder       │                      ecal_<run>.root  (ecal tree)
+ └─────────────────────────┘
+        │
+        ▼  STAGE 3 · PID/EDM4hep — a SECOND k4run (shower vars + selection)
+ ┌─────────────────────────┐
+ │  gaudi_source (C++)     │  ───────────────►  Reconstruction/<run>/
+ │  EcalToEDM4hep + PID    │                      ecal_<run>.edm4hep.root
+ └─────────────────────────┘
+        │                                                                        │
+        ▼                                                                        ▼  STAGE 4 · tracking (optional, ACTS)
+ ┌─────────────────────────┐        ┌─────────────────────────┐         ┌─────────────────────────┐
+ │   siwecal_validation    │        │      event_viewer       │         │  gaudi_source (C++)     │
+ │   validation plots only │        │   interactive Dash app  │         │  ACTSGeoSvc             │
+ │   (reads the metrics)   │        │   (3-D / 2-D / dists)   │         │  ShowerTagger           │
+ └─────────────────────────┘        └─────────────────────────┘         │  SiPadMeasConverter     │
+                                                                         │  ACTSProtoTracker       │
+                                                                         └─────────────────────────┘
+                                                                                      │
+                                                                                      ▼
+                                                                     ecal_<run>.edm4hep.root, IN PLACE
+                                                                     (gains ACTSTracks + EMShowers +
+                                                                      SiPadMeasurements + SiPadShowerFlags;
+                                                                      temp file + swap, no separate product)
+```
+
+`event_viewer` reads `ecal_<run>.edm4hep.root` whether or not tracking has run
+yet; the tracking stage is a separate, optional step that mutates that SAME
+file in place (`reconstruction/jobs/run_tracking_batch.py`) — see
+`docs/data/gaudi_source.md`'s "Tracking (ACTS)" section and
+`docs/data/acts_integration.md`.
+
+The per-event metrics **and the cut/cleaned event collections** are produced by
+`gaudi_source` (in C++, fast). `siwecal_validation` and `event_viewer` only read
+that output — neither recomputes metrics nor writes any tree.
+
+### The three pipeline stages (raw → EDM4hep)
+
+The three stages numbered in the diagram above are, in practice, **three
+separate `k4run` processes** — the CONVERT/RECO split is really decode →
+event building → PID. This is what `data_conversion/jobs/run_full_pipeline_batch.py`
+runs for one run (and what the Condor DAG runs per run on the farm):
+
+| # | Stage | Process(es) | Component | Reads | Writes |
+|---|---|---|---|---|---|
+| **1** | **decode** | **one `k4run` per raw chunk**, in parallel, + a health check | `EcalRawDecoder` | `<run>_raw.bin_NNNN` (read-only) | `<converted-dir>/<run>/chunks/chunk_NNNN.root` (`siwecaldecoded` tree) |
+| **2** | **event building** | one `k4run` **chaining** all the chunks | `EcalEventBuilder` | the chunks from stage 1 | `Reconstruction/<run>/ecal_<run>.root` (`ecal` tree) |
+| **3** | **PID / EDM4hep** | a **second** `k4run` | `EcalToEDM4hep` (hit-MIP cut) + `EcalShowerVariables` (shower vars) | `ecal_<run>.root` | `ecal_<run>.edm4hep.root` |
+| **4** | **tracking** *(optional)* | a **third** `k4run`, run separately, per run, output swapped in place | `ACTSGeoSvc` + `ShowerTagger` + `SiPadMeasConverter` + `ACTSProtoTracker` (see `docs/data/acts_integration.md`) | `ecal_<run>.edm4hep.root` (its `ECalHits`) | the SAME `ecal_<run>.edm4hep.root`, now also carrying `ACTSTracks`/`EMShowers`/`SiPadMeasurements`/`SiPadShowerFlags` — no separate file |
+
+Two design points that are easy to miss:
+
+- **Stage 1 is one process per chunk, not one process for the whole run.**
+  The old "decode every chunk in a single `k4run`" path *silently dropped
+  ~75 % of the acquisitions* on some runs. It is now one decode per chunk,
+  and `assert_healthy()` **aborts the run** if the acquisitions don't add up
+  before anything is reconstructed from them (see
+  [`data_conversion/jobs/decode_chunks.py`](data_conversion/jobs/decode_chunks.py) and the
+  `run_full_pipeline_batch.py` module docstring).
+- **Stage 3 is a separate `k4run` on purpose.** k4FWCore needs `EvtMax`
+  fixed *before* the process starts, and the physics-event count only exists
+  once the event builder (stage 2) has run — so stage 3 opens the `ecal`
+  file, reads `GetEntries()`, then sets `EvtMax`. See
+  [Note on Gaudi's event loop](#note-on-gaudis-event-loop).
+
+Calibration (pedestals + MIPs) is a **separate upstream step**, not one of
+these three: each run auto-resolves its `MuonCalib_gaudi/{pedestals,mips}/th<N>/`
+tables from its own `ThresholdDAC` (`Run_Settings.txt`). See the "MIP cut vs.
+MIP thresholds" note below — the calibration MIP scale is a different thing
+from the two per-hit "mip cut" knobs.
+
+## Packages
+
+| Package | What it does | Docs |
+|---|---|---|
+| [`siwecal_eventbuilder`](data_conversion/python/siwecal_eventbuilder/README.md) | **Legacy Python event builder — the pipeline does NOT use it.** Kept as a reference implementation; the production event builder is `gaudi_source`'s C++ `EcalEventBuilder`. See "Two event builders". | builder README |
+| [`siwecal_validation`](analysis/python/siwecal_validation/README.md) | Validation plots only: reads the per-event metrics from the `gaudi_source` output (EDM4hep / valtree), applies cuts, fits the energy peak, writes PNGs + results. Generates no trees. | validation README |
+| [`event_viewer`](event_viewer/README.md) | Plotly Dash app to browse events one by one and explore file-level distributions with dynamic cuts and clustering. | viewer README |
+| [`event_display`](event_display/data/README.md) | Standalone ROOT TEve 3-D single-event display. Runs directly under key4hep (no virtualenv needed) — just `source init_siwecalsoft.sh` and launch. | display README |
+| [`gaudi_source`](docs/data/gaudi_source.md) | Gaudi/k4FWCore stage (C++) that computes the particle-ID shower variables (a parity-validated port of `siwecal_validation.metrics`), applies the hit-level + event-level cuts, and writes the cut-passing events as **EDM4hep** (`ecal_<run>.edm4hep.root`) or a plain **valtree** TTree (`ecal_<run>.valtree.root`). | gaudi README |
+| [`gaudi_jobs`](gaudi_jobs/) | Driver de batch (`run_pid_batch.py`) y ejemplos de jobs concretos (e.g. `run000013/`). | — |
+| `siwecal_common` | Shared infrastructure: `paths`, the single source of truth for every filesystem location (driven by `settings.yml`). | — |
+
+### How they depend on each other
+
+```
+event_viewer  ──imports──▶  siwecal_eventbuilder.{geometry, pad_map}
+              └─imports──▶  siwecal_validation.metrics
+gaudi_source  ──imports──▶  siwecal_validation.{selection, event_data, vars_cache}
+siwecal_eventbuilder ─┐
+siwecal_validation  ──┼──▶  siwecal_common.paths
+gaudi_source        ──┘
+```
+
+`metrics.py` is the parity oracle: `k4SiWEcalReco` is a C++ port of it, and its
+batch driver reuses the validation's `CutSet` and tree schema so the cut logic
+and the output branches never drift. `siwecal_validation` then reads the metrics
+back from the `k4SiWEcalReco` output (it no longer touches the raw `ecal` tree).
+All modules resolve paths through `siwecal_common.paths`, so **no module
+hard-codes an absolute `/eos` path**. `settings.yml` is the default data root; a
+`data_reference*.yml` may set `main_path` to override it for a whole run list (and
+a per-entry absolute `path:` wins over both), so the run lists stay the single
+convenient place to point the suite at your data.
+
+### Reconstruction stage (Gaudi): `gaudi_source` + `gaudi_jobs`
+
+`gaudi_source` is the **Gaudi/k4FWCore** stage that computes the particle-ID
+shower variables in C++ (a parity-validated port of `siwecal_validation.metrics`)
+and produces the **cut-passing event collections** consumed downstream. Per run
+it applies an optional hit-level MIP cut and the event selection (the same
+`CutSet` as `siwecal_validation`), then writes one of two formats:
+
+- **EDM4hep** PID file `ecal_<run>.edm4hep.root` — one `Cluster` per event
+  (variables in `shapeParameters`) + `CalorimeterHit` collections.
+- **valtree** `ecal_<run>.valtree.root` — the same per-event variables in a plain
+  TTree (the valcache schema).
+
+Two modes: the default **physics** mode bakes in a `0.5` MIP per-hit cut, while
+`--validation` mode keeps raw hits and also computes the `mip05_/mip1_` variant
+blocks that feed the viewer's interactive threshold slider. All cuts are off by
+default except total per-event energy > 0 (always enforced).
+
+> #### Two different "MIP cut" knobs — don't confuse them
+>
+> There are **two** MIP-related settings on the PID stage, and they do
+> different things:
+>
+> - **(A) `HitMipCut`** — env `ECAL_HIT_MIP_CUT`, flag `--hit-mip-cut`,
+>   Gaudi property `EcalToEDM4hep.HitMipCut`. A **per-hit energy cut**: hits
+>   below this many MIPs are dropped *before* the metrics are computed (`<0`
+>   disables it).
+> - **(B) `MipThresholds`** — env `ECAL_MIP_THRESHOLDS`, constant
+>   `siwecal_validation.vars_cache.MIP_CUT_THRESHOLDS`, Gaudi property
+>   `EcalShowerVariables.MipThresholds`. A **list of extra thresholds** at
+>   which the whole shower-variable block is **recomputed** and stored again
+>   under the prefixes `mip05_` / `mip1_`. This is what feeds the viewer's
+>   threshold slider; it does not change which hits survive.
+>
+> The **"three sets of variables"** older docs/scripts produced were the
+> base block (no extra cut) **plus** `mip05_` **plus** `mip1_` — i.e. knob
+> (B) set to `0.5,1.0` (the `mip05_*` / `mip1_*` prefixes in the
+> `shapeParameters` / valtree tables below). The default pipeline turns (B)
+> **off**, so you now get one block only. Defaults differ by driver:
+>
+> | Driver | (A) `HitMipCut` | (B) `MipThresholds` → `mip05_/mip1_` blocks |
+> |---|---|---|
+> | `run_full_pipeline_batch.py` (interactive, one run) | `0.5` | **none** (physics mode) |
+> | `run_pid_batch.py` (batch) | per-YAML / `--hit-mip-cut` | none; `[0.5, 1.0]` with `--validation` |
+> | `run_pid.py` (bare `k4run`) | off (`-1`) | **`0.5,1.0` by default** → 3 versions |
+>
+> So a bare `k4run reconstruction/pid/options/run_pid.py` still writes all three
+> blocks, while the batch/interactive drivers default to the single
+> physics block. This difference is intentional (physics vs. visualiser
+> mode); set `ECAL_MIP_THRESHOLDS`/`--validation` to opt back in.
+
+```bash
+# Build it once (./install.sh does this for you) and load the env:
+./install.sh --no-viewer      # or the manual cmake build, see k4SiWEcalReco/README.md
+source init_siwecalsoft.sh               # puts the build on LD_LIBRARY_PATH/PYTHONPATH for k4run
+
+# batch driver, same input options as siwecal_validation (--run/--file/--all/--point/--cfg)
+python reconstruction/jobs/run_pid_batch.py --run TB2026CERN_run_000007
+python reconstruction/jobs/run_pid_batch.py --all --format both --nhit-min 20
+python reconstruction/jobs/run_pid_batch.py --run TB2026CERN_run_000007 --validation   # viewer mode
+# the cuts run inside the Gaudi job (EcalEventSelection); --dry-run prints each job's environment
+
+# concrete job example (steering file for run000013, physics mode)
+k4run data_conversion/jobs/runs/run000013/steer_run000013.py
+
+# validation / viewer then consume the output directly
+python -m siwecal_validation --run TB2026CERN_run_000007
+```
+
+> ⚠️ **Masked channels.** Two classes of channels are flagged `hit_ismasked = 1`
+> in the `ecal` tree and excluded from all downstream stages (EDM4hep / valtree,
+> metrics, plots):
+> - **No MIP calibration** (`mpv = 0` in the MIP file).
+> - **No valid pedestal** (all 15 SCA means are `-nan` in the pedestal file — the
+>   calibration tool's sentinel for channels with insufficient statistics).
+>
+> Channels with only *partial* NaN coverage (some SCAs finite, some `-nan`) are
+> **not** masked; the first valid SCA mean is substituted for the missing ones.
+> See [`data_conversion/python/siwecal_eventbuilder/README.md`](data_conversion/python/siwecal_eventbuilder/README.md) for the
+> full discussion and open questions.
+>
+> If you open the viewer directly on a **raw** `ecal_<run>.root` (instead of the
+> `gaudi_source` output — the EDM4hep or valtree file), masked hits *will* show
+> up — the `ecal` tree keeps them as a raw record.
+
+See [`docs/data/gaudi_source.md`](docs/data/gaudi_source.md) for details.
+
+## Tree schemas
+
+Three on-disk products carry the per-event data, in order of the pipeline:
+
+1. the reconstructed **`ecal`** tree (`ecal_<run>.root`) — raw events, *no metrics*;
+2. the **EDM4hep** PID file (`ecal_<run>.edm4hep.root`) — cut-passing events with metrics;
+3. the **valtree** (`ecal_<run>.valtree.root`) — the same content as a plain TTree.
+
+In both `k4SiWEcalReco` outputs the masked channels are already dropped, so there
+is no `hit_ismasked` branch and the per-event counters/sums are recomputed from
+the surviving hits.
+
+### `ecal` tree — reconstructed events (no metrics)
+
+One entry per BCID window. Per-hit branches are variable-length, counted by
+`nhit_chan` (also named `nhit` downstream).
+
+| Var          | Description                                            |
+| ------------ | ------------------------------------------------------ |
+| run          | run number                                             |
+| event        | event number. `spill_index * 1000 + event_index`       |
+| spill        | spill number                                           |
+| bcid         | bcid id                                                |
+| nhit_slab    | Number of distinct slabs contributing to this window.  |
+| nhit_chip    | Number of distinct ``(slab, chip)`` pairs with hits .  |
+| sum_hg       | Sum of pedestal-subtracted high-gain ADC over all hits |
+| sum_energy   | Sum of calibrated energy over all hits                 |
+| sum_w_energy | Sum of `hit_w_energy` over all hits                     |
+| hit_slab     | physical slab slot (ib, 0..14)                         |
+| hit_chip     | hardware chip ID (chipid)                              |
+| hit_chan     | pixel index (ipix, 0..63)                              |
+| hit_sca      | SCA memory cell (isca, 0..14)                          |
+| hit_hg       | high-gain ADC minus the high-gain pedestal            |
+| hit_lg       | low-gain ADC minus the low-gain pedestal              |
+| hit_energy   | signal in MIP units. From the high gain, except on a hit whose raw `adc_high` saturates the preamp (`AdcSaturationThreshold`, 1900), where it comes from the low gain with its own pedestal and MIP scale |
+| hit_w_energy | `hit_energy * W[slab] / X0`: the sampling correction. The layers do not all sit behind the same absorber (2.8 / 4.2 / 5.6 mm of W), so a MIP in a thick-absorber layer stands for more incident energy than one in a thin layer. Summing it over an event gives the same quantity as the PID's `weighte` |
+| hit_x        | transverse position in mm                              |
+| hit_y        | transverse position in mm                              |
+| hit_z        | longitudinal position in mm                            |
+| hit_X0       | **cumulative** radiation lengths of W up to and including this slab (not the local absorber depth — that is the weight inside `hit_w_energy`) |
+| hit_ismasked | masked in ped or MIP file                              |
+
+### EDM4hep PID file (`ecal_<run>.edm4hep.root`)
+
+One podio `events` frame per cut-passing event. Three collections plus six
+parallel per-hit `UserDataCollection`s. The legacy column each maps to (read back
+by `siwecal_common.edm4hep_pid`) is shown in parentheses.
+
+| Collection / field                        | Description                                                      |
+| ----------------------------------------- | --------------------------------------------------------------- |
+| `EventHeader.runNumber`                   | run number (→ `run`)                                            |
+| `EventHeader.eventNumber`                 | event number (→ `event`)                                        |
+| `EventHeader.weight`                      | spill number (→ `spill`)                                        |
+| `EventHeader.timeStamp`                   | bcid id (→ `bcid`)                                              |
+| `ECalHits` (`CalorimeterHit`) `.type`     | physical slab slot 0..14 (→ `hit_slab`)                         |
+| `ECalHits.position` (x, y, z)             | hit position in mm (→ `hit_x` / `hit_y` / `hit_z`)             |
+| `ECalHits.energy`                         | calibrated hit signal in MIP units (→ `hit_energy`)            |
+| `ECalHitChip` (UserData)                  | hardware chip ID (→ `hit_chip`)                                |
+| `ECalHitChan` (UserData)                  | pixel index 0..63 (→ `hit_chan`)                               |
+| `ECalHitSca` (UserData)                   | SCA memory cell 0..14 (→ `hit_sca`)                            |
+| `ECalHitHG` (UserData)                    | high-gain ADC minus pedestal (→ `hit_hg`)                      |
+| `ECalHitLG` (UserData)                    | low-gain ADC minus the low-gain pedestal (→ `hit_lg`)          |
+| `ECalHitWE` (UserData)                    | sampling-corrected energy (→ `hit_w_energy`)                   |
+| `ECalHitX0` (UserData)                    | cumulative W radiation lengths up to the hit's slab (→ `hit_X0`) |
+| `ECalPid` (`Cluster`) `.shapeParameters`  | the per-event metrics, one cluster/event (see table below)      |
+
+`ECalHitWE` / `ECalHitX0` are always written, even from an `ecal` file predating
+the `hit_w_energy` / `hit_X0` branches: `EcalToEDM4hep` then recomputes them from
+the same `SlabGeometry` the event builder would have used, which is exact (both
+are pure functions of `hit_slab`). PID files written **before** those two
+collections existed stay readable — `siwecal_common.edm4hep_pid` reports them via
+`PidFileReader.perhit_fields()` and simply omits what a file does not carry.
+
+**Simulation runs also carry `ACTSTracks` / `EMShowers` / `SiPadMeasurements` /
+`SiPadShowerFlags`** — no separate tracks file. `run_pid_batch.py --tracks-file
+<path>` merges those four collections straight into the SAME
+`ecal_<run>.edm4hep.root` the PID job writes (`run_pid.py` `PID_MERGE_FILE`); the caller passes the path explicitly (no
+sibling-file auto-discovery) — `siwecal_k4sim/simulation/campaign/run_pid_sim.sh` wires
+it to the exact `digitized.edm4hep.root` it fed into `sim_to_ecal_tree.py`
+(see `siwecal_k4sim/docs/sim/gaudi_pipeline.md`, "Single-file output", for where
+that file comes from). `SiPadHits*`/`MCParticles` are deliberately **not**
+pulled in: `ECalHits` already covers the raw hits, and those collections
+carry `SimCalorimeterHit`→`CaloHitContribution` relations that segfault when
+resolved against a second, concurrently-open podio `Reader` — the four merged
+collections are relation-free `Track`/`Cluster`/`TrackerHit3D`/
+`UserDataCollection` types, so they merge cleanly. Real test-beam runs never
+pass `--tracks-file`, so their PID files are unaffected —
+`PidFileReader.track_counts()` returns `None` for them, same as for any older
+simulation PID file written before this merge existed.
+
+The real-data ACTS **tracking** stage (below) is a separate, later step: it
+runs on the already-produced `ecal_<run>.edm4hep.root` (its `ECalHits`) and
+merges its own output back into that SAME file in place — no `--tracks-file`
+involved, and no separate `tracks_<run>.edm4hep.root` file either.
+
+The `shapeParameters` floats are stored in a fixed order (names listed once in
+the `metadata` frame parameter `ECalPid_shapeParameterNames`):
+
+| shapeParameter      | Description                                                       |
+| ------------------- | ---------------------------------------------------------------- |
+| nhit                | number of (unmasked) hit channels in the event                   |
+| zbary               | energy-weighted mean slab index (layer units)                    |
+| energy              | summed hit energy (MIP units)                                    |
+| mip_likeness        | inverse-hit-rate MIP-likeness score (Σ 1/hits_layer / n_layers)  |
+| weighte             | tungsten-weighted energy Σ E·W/X0                                |
+| bar_x               | energy-weighted transverse barycenter x (mm)                     |
+| bar_y               | energy-weighted transverse barycenter y (mm)                     |
+| bar_r               | radial barycenter √(bar_x² + bar_y²) (mm)                        |
+| moliere             | 90% transverse containment (Molière) radius in mm (showers; 0 else) |
+| transverse_rms      | energy-weighted RMS hit radius about the shower axis (mm)        |
+| is_shower           | longitudinal shower flag (0/1): a shower onset was found (below) |
+| shower_start        | first shower layer (NaN if not a shower)                         |
+| shower_max          | peak (maximum) layer of the profile                              |
+| shower_end          | last shower layer                                                |
+| shower_start_10     | first layer above 10% of the peak                               |
+| shower_end_10       | last layer above 10% of the peak                                |
+| shower_length       | number of layers above the shower threshold                     |
+| first_layer         | lowest layer with a hit                                         |
+| last_layer          | highest layer with a hit                                        |
+| n_layers_hit        | number of layers with at least one hit                          |
+| e_over_nhit         | energy / nhit (hit energy density)                              |
+| shower_onset        | conversion layer: first of the dense run (NaN if not a shower)   |
+| n_layers_before_onset | hit layers ahead of the onset: the pre-shower track length     |
+| fractal_dimension   | shower fractal dimension, CALICE definition (see below)          |
+| barxy_min_border_distance | min(L − \|bar_x\|, L − \|bar_y\|): barycenter → active edge (mm, see below) |
+| hits_per_layer_0..14    | per-layer hit count (one float per layer)                   |
+| energy_per_layer_0..14  | per-layer Σ E (one float per layer)                         |
+| weighte_per_layer_0..14 | per-layer tungsten-weighted energy (one float per layer)    |
+
+In `--validation` mode the same 25 scalars are appended twice more, recomputed
+after a per-hit cut, under the prefixes `mip05_` (`hit_energy ≥ 0.5`) and `mip1_`
+(`hit_energy ≥ 1.0`) — e.g. `mip05_moliere`, `mip1_is_shower`. These are the
+extra blocks knob **(B) `MipThresholds`** adds (see *"Two different 'MIP cut'
+knobs"* above); they feed the viewer's interactive threshold slider, and the
+default physics-mode pipeline omits them, so most files carry the base block
+only.
+
+#### `fractal_dimension`
+
+M. Ruan et al., PRL 112 (2014) 012001, eq. 1: the pads of each layer are
+regrouped into α × α super-cells (transverse only, layers never merged), N_α is
+the number of occupied (layer, super-cell) pairs, and
+`FD = ⟨log(N_1/N_α) / log α⟩ + 1` averaged over α ∈ {2, 3, 4, 6, 8} on the
+32 × 32 pad grid (5.53 mm pitch; the extra 6.75 − 5.53 mm wafer gap at 0 is
+removed before indexing). The "+1" is the paper's longitudinal degree of
+freedom: a MIP track (one pad per layer) gives exactly 1, electromagnetic
+showers well above. Same positive-energy hit set as the transverse moments.
+Python mirror: `siwecal_validation.metrics.fractal_dimension`. PID files
+written before it existed read back as NaN.
+
+#### `barxy_min_border_distance`
+
+Distance from the transverse barycenter `(bar_x, bar_y)` to the nearest edge of
+the active area, `min(L_x − |bar_x|, L_y − |bar_y|)` in mm, with
+`L = 89.09 mm` (outer pad centre 86.325 mm + half a 5.53 mm pad; properties
+`ActiveHalfSizeX/Y`). Negative outside the active area, NaN when the event has
+no positive-energy hit (where `bar_*` read 0). It is the lateral-containment
+handle: a cut such as `border_min: 40` keeps showers whose core is well inside
+the detector. Python mirror: `siwecal_validation.metrics.min_border_distance`;
+PID files written before it existed read back as NaN.
+
+#### How `is_shower` is decided
+
+An event is a shower when a **shower onset** exists: `ShowerOnsetMinConsecutive`
+(2) consecutive layers, each with at least `ShowerOnsetMinNhit` (4) hits within
+`ShowerCoreRadiusMm` (30 mm) of the transverse barycentre. `shower_onset` is the
+first of them. A through-going MIP lights one or two pads per layer, so it never
+reaches the threshold, let alone twice in a row; the core restriction is what
+keeps scattered pedestal noise from inflating a layer's density.
+
+Two things this buys over the previous criterion (which asked for N *ascending*
+core-density layer pairs):
+
+* A cascade that opens near the back of the stack — a pion punching through and
+  interacting late, the topology PID cares most about — can run out of layers
+  before producing the required rise, and be missed. A dense run does not need
+  the profile to still be climbing.
+* `n_layers_before_onset` is the length of the incoming track segment: ~0-1 for
+  an electron converting immediately, several layers for a pion or a radiative
+  muon that traverses as a MIP first. That distinction is the e/π handle the
+  longitudinal variables did not previously expose, and it is cuttable
+  (`n_layers_before_onset_min/max`, suffix token `nPre`).
+
+Measured on simulation the flag itself does not move: e⁻ 74 GeV and µ⁻ 100 GeV
+classify exactly as before (300/300 and 5/5 events, no disagreement). The
+criterion is the same decision reached in a form that also yields the conversion
+layer and the pre-shower length.
+
+The definition lives in `showerOnset()` in
+`reconstruction/pid/include/siwecal/EcalShowerVars.h` and is mirrored in
+`analysis/python/siwecal_validation/metrics.py` and `event_viewer/_metrics.py`. It is the same
+definition the simulation's `ShowerTagger` (in `siwecal_k4sim`) uses to keep
+cascade hits out of the ACTS measurement pool, so simulation and analysis agree
+on where a shower begins. Changing it means changing all three; the parity test
+is that the viewer's recompute at threshold 0 reproduces the flag stored in the
+file.
+
+### valtree (`ecal_<run>.valtree.root`)
+
+A plain `ecal` TTree (the valcache schema) carrying exactly the EDM4hep content
+flattened into branches: the event identifiers, the recomputed counters/sums, the
+per-hit arrays, and the per-event metrics.
+
+| Var                     | Description                                                       |
+| ----------------------- | ---------------------------------------------------------------- |
+| run, event, spill, bcid | event identifiers (as in the `ecal` tree)                        |
+| nhit_chan               | number of surviving hit channels (counts the `hit_*` arrays)     |
+| nhit_slab               | number of distinct slabs with hits                              |
+| nhit_chip               | number of distinct `(slab, chip)` pairs with hits               |
+| sum_hg                  | Σ high-gain ADC (pedestal-subtracted) over the surviving hits    |
+| sum_energy              | Σ calibrated energy (MIP units) over the surviving hits          |
+| hit_slab/chip/chan/sca  | per-hit integer arrays, as in the `ecal` tree (masked removed)   |
+| hit_hg/lg               | per-hit high/low-gain ADC minus pedestal                        |
+| hit_energy              | per-hit signal in MIP units                                     |
+| hit_x/y/z               | per-hit position in mm                                          |
+| hit_w_energy            | sampling-corrected energy, from `ECalHitWE` (omitted when the source PID file predates that collection) |
+| hit_X0                  | cumulative W radiation lengths up to the hit's slab, from `ECalHitX0` (same caveat) |
+| nhit … e_over_nhit      | the 21 per-event scalar metrics — same as the EDM4hep `shapeParameters` table |
+| hits/energy/weighte_per_layer | the three `[n_layers]` per-layer profiles                  |
+| mip05_*, mip1_*         | per-hit-cut scalar variants (validation mode only, as above)     |
+
+## The software stack
+
+- **[key4hep](https://key4hep.github.io/)** from CVMFS provides the scientific
+  Python stack used everywhere: `numpy`, `scipy`, `pandas`, `scikit-learn`,
+  `matplotlib`, `pyyaml`, `uproot`, `awkward` and **ROOT** (PyROOT). The event
+  builder and `gaudi_source` write ROOT trees with PyROOT; `siwecal_validation`
+  and the viewer read with `uproot` (no PyROOT needed there).
+- **dash + plotly** (the only packages not in key4hep) power the `event_viewer`
+  web UI. They live in a local `--system-site-packages` virtualenv,
+  `.venv-viewer` (not versioned — recreate it per machine, see below).
+- **`gaudi_source`** (the Gaudi/k4FWCore plugin) and its jobs driver
+  (`reconstruction/jobs/run_pid_batch.py`) also require key4hep. Build with CMake once
+  and export `LD_LIBRARY_PATH` / `PYTHONPATH` as shown above.
+
+## Quick start
+
+```bash
+# 1. Clone and enter the repo
+git clone <this-repo> siwecal-tb2026 && cd siwecal-tb2026
+
+# 2. Tell the suite where your data lives
+cp settings.example.yml settings.yml
+$EDITOR settings.yml          # set data_dir to your run/event directory
+
+# 3. Install the stack once (key4hep + .venv-viewer + k4SiWEcalReco build)
+./install.sh
+
+# 4. Load the environment in every new shell
+source init_siwecalsoft.sh
+
+# 5. (optional) register the Jupyter kernel that uses this same environment
+./jupyter_kernel.sh install
+```
+
+### Two scripts: `install.sh` (once) vs `setup.sh` (every shell)
+
+The stack has three pieces; `install.sh` performs the one-time, heavy setup of
+all of them and `setup.sh` is the lightweight per-shell environment loader.
+
+| Piece | What it is | `install.sh` does | `setup.sh` does |
+|---|---|---|---|
+| **key4hep** | the cvmfs scientific stack (numpy/scipy/uproot/ROOT…) | sources it | sources it |
+| **`.venv-viewer`** | the viewer's `dash`/`plotly` (not in key4hep, not committed) | creates it + `pip install` | activates it if present |
+| **`k4SiWEcalReco`** | the compiled Gaudi plugin `k4run` loads | builds it (cmake) | puts the build on `LD_LIBRARY_PATH`/`PYTHONPATH` |
+
+```bash
+./install.sh                 # all three pieces (default)
+./install.sh --no-k4         # skip the C++ build (e.g. viewer-only machine)
+./install.sh --no-viewer     # skip the dash/plotly venv
+./install.sh --force-venv    # recreate .venv-viewer from scratch
+./install.sh -j 8            # build with 8 parallel jobs
+KEY4HEP_RELEASE=2026-02-01 ./install.sh   # pin a different key4hep release
+```
+
+The default key4hep release lives in **`.key4hep-release`** — the single source
+of truth read by both `install.sh` and `setup.sh`. Edit that file to move the
+whole suite to a new release; the `KEY4HEP_RELEASE` env var overrides it per run.
+The one deliberate exception is the Jupyter kernel, which tracks `latest` unless
+installed with `--pinned` (see below).
+
+`.venv-viewer` is **not** committed (it bakes in absolute CVMFS paths), and the
+`k4SiWEcalReco/build/` tree is machine-specific — both are recreated by
+`install.sh` per machine. After installing, `source init_siwecalsoft.sh` wires everything
+up: it sources key4hep, puts the repo + the `k4SiWEcalReco` build on
+`PYTHONPATH`, and activates `.venv-viewer` automatically.
+
+### Jupyter: `jupyter_kernel.sh`
+
+Jupyter cannot `source` anything — a kernel is a fixed command line — so a
+notebook opened with the stock `python3` kernel has **no** ROOT, no uproot and
+no repo on `PYTHONPATH`. `jupyter_kernel.sh` registers a kernelspec whose
+command is that same script in launch mode: it sources `setup.sh` exactly like a
+terminal does and then execs `ipykernel`. One file, so the kernel cannot drift
+away from the rest of the environment.
+
+```bash
+# once per machine/user: register the kernel
+./jupyter_kernel.sh install
+
+# start a server here (headless; reach it over an SSH tunnel like the viewer)
+./jupyter_kernel.sh lab --port 8888
+#   ssh -N -L 8888:localhost:8888 <user>@<host>     (from your laptop)
+```
+
+Then pick **“SiW-ECAL (key4hep latest)”** in the JupyterLab launcher (or
+*Kernel → Change kernel* in an existing notebook, e.g.
+`analysis/notebooks/test_rootfiles.ipynb`). Inside it, `import ROOT`, `uproot`,
+`siwecal_common`, `siwecal_validation`, … all work, and so does the compiled
+`k4SiWEcalReco` plugin if it has been built.
+
+The kernel is installed under `~/.local/share/jupyter/kernels/`, so **any**
+Jupyter on the account sees it — your own JupyterLab, a JupyterHub with the
+default paths — without that server knowing anything about this repo.
+
+```bash
+./jupyter_kernel.sh install --bare        # key4hep only, no repo wiring
+./jupyter_kernel.sh install --force       # overwrite an existing kernel
+./jupyter_kernel.sh install --pinned      # use .key4hep-release instead of latest
+./jupyter_kernel.sh install --release 2026-02-01     # a specific release
+./jupyter_kernel.sh install --name x --display-name "…"   # custom kernel name
+./jupyter_kernel.sh list                  # kernels Jupyter can see
+./jupyter_kernel.sh remove [name]         # unregister
+```
+
+#### Which key4hep release the kernel uses
+
+The kernel defaults to **`latest`** and re-resolves it at *every start*, so it
+follows the key4hep stack as new releases appear — no reinstall needed. This is
+deliberately **not** `.key4hep-release`: that file pins what `gaudi_source` is
+*compiled* against (see above), while for interactive notebooks the useful
+default is the current stack. `setup.sh` prints which release latest resolved
+to, e.g. `[setup] key4hep latest (2026-04-08) + .venv-viewer active`.
+
+Use **`--pinned`** if a notebook has to load the compiled `k4SiWEcalReco`
+plugin: its ABI follows the release it was built with, so there the kernel must
+match `.key4hep-release`. `--release <date>` freezes the kernel on one release
+for good.
+
+> **`-r latest` is a trap** and the scripts never use it:
+> `releases/latest` is a dead 2024-04-12 tree (ROOT 6.28), while the real
+> latest is `releases/latest-opt` — which is what key4hep itself uses by
+> default and what `k4_setup_release` (in `key4hep_release.sh`) translates
+> `latest` into.
+
+`install` refuses to write the kernelspec if `ipykernel` cannot be imported in
+the resulting environment, so a broken setup shows up there instead of as a dead
+kernel in a notebook.
+
+> **Kernels inherit the server's environment**, and key4hep cannot be swapped
+> inside a live process: a Jupyter started from a shell with a *different*
+> release would poison every kernel it spawns. Two things prevent that.
+> `setup.sh` / `setupkey4hep.sh` skip the CVMFS step when the requested release
+> is already loaded (so re-sourcing and `jupyter_kernel.sh lab` work from any
+> shell), and if the inherited release is genuinely a different one the kernel
+> **restarts itself in a clean environment** — keeping only the account, PATH,
+> locale and Kerberos/X11/grid credentials — instead of dying.
+
+## Configuration: `settings.yml`
+
+A single file at the repo root, read by all packages through
+`siwecal_common.paths`. Copy `settings.example.yml` and edit:
+
+```yaml
+data_dir:                                   # heavy run/event ROOT files (NOT in repo)
+  - /eos/home-o/oarquero/TB2026CERN         #   single path or a LIST of search roots
+calib_dir:    ./calibration                 # pedestal / MIP files (vendored)
+geometry_dir: ./mappings                    # pad maps, slab z, tungsten map
+configs_dir:  ./configs/data                # data_reference*.yml run lists
+reconstruction_dir:                         # reconstructed events + validation,
+  /eos/.../TB2026-06/Reconstruction         #   one folder per run, OUTSIDE Data/
+output_dir:   null                          # validation base (null = reconstruction_dir)
+pid_dir:      null                          # gaudi_source outputs (null = next to input)
+cache_dir:    null                          # legacy *.valcache.root (null = next to input)
+```
+
+Notes:
+- `data_dir` may be a **list of search roots**: inputs are looked up in each, in
+  order, and the first match wins. It is the default data root.
+- A `data_reference*.yml` may set `main_path` to point a whole run list at a
+  specific root; when present it **takes precedence** over `settings.yml`'s
+  `data_dir`. A per-entry absolute `path:` wins over both, and files not found
+  under `main_path` fall back to the `data_dir` roots.
+- `pid_dir` is where `k4SiWEcalReco` writes (and `siwecal_validation` /
+  `event_viewer` look for) `ecal_<run>.edm4hep.root` / `ecal_<run>.valtree.root`
+  — set it when your data directory is read-only.
+- `cache_dir` is the legacy `*.valcache.root` location (still read by the viewer
+  if present); `siwecal_validation` no longer writes caches.
+- Point to a different settings file with `export SIWECAL_SETTINGS=/path/to.yml`.
+
+## Repository layout
+
+```
+siwecal-tb2026/
+├── settings.yml / settings.example.yml   shared configuration
+├── install.sh                           one-time installer (key4hep venv + k4 build)
+├── setup.sh                              per-shell environment loader
+├── setupkey4hep.sh                       bare key4hep (no repo wiring)
+├── jupyter_kernel.sh                     Jupyter kernel on the key4hep stack (+ `lab`)
+├── notebooks/                            notebooks (run them with the kernel above)
+├── requirements.txt                      dash + plotly (rest from key4hep)
+├── requirements-nodeps.txt               seaborn (--no-deps, deps from key4hep)
+├── siwecal_common/                       shared path resolution
+├── siwecal_eventbuilder/                 event building (+ README)
+├── siwecal_validation/                   validation + metrics (+ README)
+├── event_viewer/                         Dash viewer (+ README)
+├── event_display/                        ROOT TEve 3-D event display (native key4hep, no extra deps)
+├── gaudi_source/                         Gaudi/k4FWCore C++ source + CMake + steering file genérico
+├── gaudi_jobs/                           driver de batch (run_pid_batch.py) + ejemplos de jobs
+│   └── run000013/                        ejemplo concreto para TB2026CERN_run_000013
+├── mappings/                             pad maps, slab_z_positions.yml, Tungsten_thickness.yml
+├── analysis/configs/data/                         data_reference*.yml run lists
+└── calibration/                          vendored dummy pedestal/MIP files
+```
+
+Heavy per-run data (`ecal_<run>.root`, the `gaudi_source` outputs
+`ecal_<run>.edm4hep.root` / `ecal_<run>.valtree.root`, raw inputs) live
+**outside** the repo, under `data_dir`.
+
+## Two event builders
+
+There are two implementations of the event builder, and **only one of them runs**:
+
+| | `gaudi_source` — `EcalEventBuilder` | `siwecal_eventbuilder` |
+|---|---|---|
+| Language | C++ (Gaudi component) | Python |
+| Used by the pipeline | **YES** — this is production | no |
+| Entry point | `k4run data_conversion/options/run_event_builder.py` | `python -m siwecal_eventbuilder` |
+| Source | `data_conversion/include/siwecal/EventBuilder.h` (logic) + `src/components/EcalEventBuilder.cpp` (Gaudi wrapper) | `data_conversion/python/siwecal_eventbuilder/event_builder.py` |
+
+Everything the reconstruction depends on lives in the **C++** one: low-gain
+recovery for saturated hits, the ADC saturation threshold, `hit_w_energy`, and the
+splicing of acquisitions split across a raw-chunk boundary. The Python one has
+**none of it** and has drifted.
+
+This has already bitten us: a low-gain-saturation fix was once committed to the
+Python builder only, so the pipeline — which runs the C++ one — silently did not
+have it. If you change event-building behaviour, change `EventBuilder.h`. The
+only part of `siwecal_eventbuilder` the pipeline still imports is
+`cli.resolve_gaudi_calib_files()`, which picks the calibration tables for a
+threshold.
+
+### Note on Gaudi's event loop
+
+`EcalEventBuilder` is a plain `Gaudi::Algorithm` that does **all** its work in
+`initialize()`, with `EvtSel="NONE"`, `EvtMax=1` and a no-op `execute()`. It does
+not use Gaudi's event loop, and cannot: one DAQ *acquisition* (a SKIROC readout
+cycle) contains **many** physics events, separated by BCID clustering — run_000060
+turns 28,915 acquisitions into 66,958 events. Gaudi needs `EvtMax` fixed before
+the process starts, and that count only exists once the events are built.
+
+That BCID clustering is *adjacency-based*, not a fixed-width time window:
+hits within `MergeDelta` (default **3**) BCID counts of each other form one
+event. The window granularity and the other clustering knobs
+(`SkipBcidStart`, `MinSlabsHit`, …) are `EcalEventBuilder` Gaudi properties;
+the pipeline leaves them at their defaults unless you export `EVBLD_MERGE_DELTA`,
+`EVBLD_MIN_SLABS_HIT`, `EVBLD_DROP_RETRIGGER` or `EVBLD_RETRIGGER_DELTA` (the ones
+it forwards). `EVBLD_DROP_RETRIGGER=1` masks SKIROC retriggers before clustering —
+off by default, and behaviour-changing. See
+[docs/data/gaudi_source.md → "How hits become events"](docs/data/gaudi_source.md#how-hits-become-events-bcid-clustering-the-time-window)
+for the algorithm and the full property table.
+
+That is also why PID runs as a **second** `k4run` process: `EcalToEDM4hep` /
+`EcalShowerVariables` *are* k4FWCore components that follow the event loop, so
+`run_pid.py` opens the `ecal` file, reads `GetEntries()`, and only then sets
+`EvtMax`.
+
+## End-to-end example
+
+```bash
+source init_siwecalsoft.sh
+
+# The whole campaign, on the batch farm: CONVERT (one job per raw chunk) ->
+# RECO (event building + PID) -> VALIDATE, one folder per run.
+python data_conversion/jobs/condor/generate_reco_dag.py \
+    --runs TB2026CERN_run_000012,TB2026CERN_run_000013 \
+    --out-dir data_conversion/jobs/condor/generated/electrons
+condor_submit_dag data_conversion/jobs/condor/generated/electrons/reco.dag
+
+# Or one run interactively (same three stages, no farm):
+python data_conversion/jobs/run_full_pipeline_batch.py --run TB2026CERN_run_000013
+
+# 3. Validate it: plots + fits with the cuts you want (reads the step-2 output)
+python -m siwecal_validation --run TB2026CERN_run_000007 --nhit-min 20
+
+# 4. Inspect events interactively (open via SSH tunnel, see viewer README)
+python -m event_viewer
+
+# 4b. Or use the standalone TEve 3-D display (native key4hep, requires X11/ssh -Y)
+cd event_display/
+./launch.sh ../data/TB2026CERN_run_000007/ecal_TB2026CERN_run_000007.valtree.root
+```
+
+See each package's README for the full option list and design notes.
+
+## Making a change
+
+Every change to this repo goes through the same four steps, plus one standing
+duty. The workflow is also encoded as a Claude Code skill in
+[`.claude/skills/repo-change/SKILL.md`](.claude/skills/repo-change/SKILL.md), so
+an agent working here follows it without being told.
+
+**1 · Branch, one per topic.** Never commit to `main`. Related edits that serve
+the same purpose share a branch; unrelated work gets its own.
+
+```bash
+git fetch origin
+git switch -c fix/<slug> origin/main     # fix/ chore/ perf/ feat/ ...
+```
+
+**2 · Code.** Four traps that are specific to this repo:
+
+- **Two event builders — only one runs.** Event-building behaviour lives in the
+  C++ `data_conversion/include/siwecal/EventBuilder.h`. Changing only the
+  legacy Python `siwecal_eventbuilder/` produces a fix the pipeline never sees
+  (see "Two event builders" above).
+- **C++ needs a rebuild** before it does anything: `./install.sh --no-viewer`
+  (or the cmake build) then `source init_siwecalsoft.sh`.
+- **Python 3.9 floor, and CI has no key4hep.** CI runs the `3.9`/`3.11` matrix
+  over `siwecal_common`, `siwecal_eventbuilder`, `siwecal_validation` and
+  `event_viewer` with only `numpy pyyaml pytest` installed — no 3.10+ syntax
+  there, and keep ROOT/uproot imports lazy so those packages still import.
+- **New config key ⇒ update the template**, `settings.example.yml` (paths) or
+  `data_conversion/python/siwecal_eventbuilder/config.example.yml` (builder tunables); unknown keys are rejected at load.
+
+**3 · Tests.** There is no `python` and the system `python3` has no `pytest`,
+so load the stack first:
+
+```bash
+source init_siwecalsoft.sh
+python3 -m pytest -q analysis/python/siwecal_validation/tests/     # what CI gates on
+python3 -m compileall -q siwecal_common siwecal_eventbuilder siwecal_validation event_viewer
+python3 -m pytest -q data_conversion/tests/python/             # when touching decode / gaudi_jobs
+```
+
+key4hep's pytest plugin prints a wall of `<DartMeasurement>` XML per test; that
+is noise. Read the last summary line.
+
+**4 · Documentation.** Update the doc that describes what changed:
+
+| Changed | Update |
+|---|---|
+| pipeline stages, install/setup, repo layout | this `docs/data/README_tb2026.md` (incl. the diagram and the stage table) |
+| Gaudi components, algorithm properties, `options/` | `docs/data/gaudi_source.md` |
+| metrics, validation plots, cuts | `analysis/python/siwecal_validation/README.md` |
+| legacy Python builder | `data_conversion/python/siwecal_eventbuilder/README.md` |
+| viewer / display UI and flags | `event_viewer/README.md`, `event_display/data/README.md` |
+| batch / Condor / calibration jobs | the `gaudi_jobs/**/README.md` next to the job |
+| a config key | `settings.example.yml` / `data_conversion/python/siwecal_eventbuilder/config.example.yml` |
+
+**5 · Say so when behaviour changes.** A change is *additive* (new option off by
+default, new file, new doc — existing runs give identical output) or it is
+*behaviour-changing*, and the second must be announced explicitly. Counts as
+behaviour-changing: different numbers for the same input; a changed default of
+any Gaudi property (`SkipBcidStart`, `MinSlabsHit`, …), CLI flag or config
+value; added, removed or renamed tree branches, output files or directory
+layout; events kept or dropped that were not before; changed public signatures
+or import paths; anything that makes previously produced ROOT files
+inconsistent with new ones. State what changes, who it affects, and whether
+older outputs remain comparable.

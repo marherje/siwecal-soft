@@ -1,0 +1,29 @@
+#!/bin/bash
+set -eo pipefail
+# steer_validate.sh <run_dir> <run_tag>
+#
+# Condor executable for the per-run standalone pipelines (gaudi_jobs/run0000NN/):
+# runs the k4run event-build steer, then the k4run EDM4hep/PID validate, in one
+# job. Same key4hep + LD_LIBRARY_PATH/PYTHONPATH setup as reco.sh, so it behaves
+# identically to running the steer/validate by hand -- just on a worker node.
+#
+#   <run_dir>  absolute path to the run's pipeline folder (has steer_<tag>.py /
+#              validate_<tag>.py), e.g. .../gaudi_jobs/run000166
+#   <run_tag>  the run tag, e.g. run000166
+RUN_DIR="$1"; RUN_TAG="$2"
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Release from .key4hep-release via k4_release, so this cannot drift from the
+# build the LD_LIBRARY_PATH below points at (an ABI mismatch fails on the worker,
+# not here). A missing/malformed file aborts the job with a clear message.
+source "$REPO/key4hep_release.sh"
+K4REL="$(k4_release "$REPO")" || exit 1
+source "$REPO/init_siwecalsoft.sh" --no-venv --quiet
+
+echo "[pipeline] $RUN_TAG: event build (steer_$RUN_TAG.py)"
+k4run "$RUN_DIR/steer_$RUN_TAG.py"
+
+echo "[pipeline] $RUN_TAG: validate / EDM4hep+PID (validate_$RUN_TAG.py)"
+k4run "$RUN_DIR/validate_$RUN_TAG.py"
+
+echo "[pipeline] $RUN_TAG: done"

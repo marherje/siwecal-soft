@@ -1,0 +1,32 @@
+name: ci
+
+# Lightweight CI: the full suite needs the key4hep stack from cvmfs (uproot,
+# ROOT, ...), which is not available on GitHub runners. But the core -- the
+# `siwecal_validation.metrics` C++ parity oracle and the geometry config -- is
+# importable with numpy + pyyaml alone (the package __init__ is lazy), so we
+# lint and unit-test that here. Keep the install list below in sync: key4hep
+# ships these anyway, so a missing one only ever shows up on the runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  metrics-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip numpy pyyaml pytest
+      - name: Byte-compile all sources
+        run: python -m compileall -q common/python data_conversion/python analysis/python event_viewer
+      - name: Run metrics unit tests
+        run: pytest -q analysis/python/siwecal_validation/tests/

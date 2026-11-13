@@ -1,0 +1,202 @@
+"""
+Unit tests for :mod:`siwecal_validation.metrics`.
+
+Synthetic single events with known answers. Runs under pytest, or standalone:
+
+    python3 analysis/python/siwecal_validation/tests/test_metrics.py
+"""
+
+import math
+import os
+import sys
+
+import numpy as np
+
+from siwecal_validation import metrics as m  # noqa: E402
+
+
+def test_basic_sums():
+    slab = np.array([0, 0, 2], dtype=np.int32)
+    energy = np.array([1.0, 2.0, 3.0], dtype=float)
+    assert m.total_energy(energy) == 6.0
+    hpl = m.hits_per_layer(slab, 4)
+    assert list(hpl) == [2, 0, 1, 0]
+    epl = m.energy_per_layer(slab, energy, 4)
+    assert list(epl) == [3.0, 0.0, 3.0, 0.0]
+    # zbary = (1*0 + 2*0 + 3*2) / 6 = 1.0
+    assert m.zbary(slab, energy) == 1.0
+
+
+def test_zbary_empty():
+    assert math.isnan(m.zbary(np.array([], dtype=np.int32), np.array([])))
+
+
+def test_mip_likeness():
+    # layer 0 has 2 hits, layer 2 has 1 hit -> (1/2 + 1/1)/n_layers
+    hpl = np.array([2.0, 0.0, 1.0, 0.0])
+    assert m.mip_likeness(hpl, 4) == (0.5 + 1.0) / 4
+    # a perfect MIP: 1 hit in each of n layers -> score 1.0
+    assert m.mip_likeness(np.ones(5), 5) == 1.0
+
+
+def test_layer_extent():
+    hpl = np.array([0.0, 3.0, 0.0, 2.0, 0.0])
+    first, last, n = m.layer_extent(hpl)
+    assert (first, last, n) == (1.0, 3.0, 2)
+    f, l, n0 = m.layer_extent(np.zeros(5))
+    assert math.isnan(f) and math.isnan(l) and n0 == 0
+
+
+def test_weighte():
+    # The real stack: 2.8 mm of W in front of slab 0, 4.2 mm for slabs 1-8 and
+    # 5.6 mm for slabs 9-14; over X0(W)=3.5 mm that is 0.8 / 1.2 / 1.6.
+    # Slab 8 is 1.2, NOT 1.6 -- this fixture used to say otherwise, matching a
+    # wrong Tungsten_thickness.yml.
+    slab = np.array([0, 9], dtype=np.int32)        # W/X0 = 0.8 and 1.6
+    energy = np.array([1.0, 1.0], dtype=float)
+    w_over_x0 = np.array([0.8] + [1.2] * 8 + [1.6] * 6)
+    # 1*0.8 + 1*1.6 = 2.4
+    assert abs(m.weighte_total(slab, energy, w_over_x0) - 2.4) < 1e-9
+    wpl = m.weighte_per_layer(slab, energy, w_over_x0, 15)
+    assert abs(wpl[0] - 0.8) < 1e-9 and abs(wpl[9] - 1.6) < 1e-9
+
+
+def test_barycenter_and_rms():
+    # four unit-weight hits at (+-1, 0), (0, +-1): barycenter at origin, r=1
+    x = np.array([1.0, -1.0, 0.0, 0.0])
+    y = np.array([0.0, 0.0, 1.0, -1.0])
+    w = np.ones(4)
+    bx, by, br = m.barycenter_xy(x, y, w)
+    assert abs(bx) < 1e-12 and abs(by) < 1e-12 and abs(br) < 1e-12
+    assert abs(m.transverse_rms(x, y, w, bx, by) - 1.0) < 1e-12
+
+
+def test_barycenter_zero_weight():
+    x = np.array([1.0]); y = np.array([1.0]); w = np.array([0.0])
+    assert m.barycenter_xy(x, y, w) == (0.0, 0.0, 0.0)
+
+
+def test_moliere_ring():
+    # ring of equal-energy hits at radius 5 -> 90% radius is 5; single hit -> 0
+    n = 20
+    ang = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    x = 5 * np.cos(ang); y = 5 * np.sin(ang)
+    w = np.ones(n)
+    assert abs(m.moliere_radius(x, y, w, 0.0, 0.0, 0.9) - 5.0) < 1e-9
+    assert m.moliere_radius(np.array([0.0]), np.array([0.0]), np.array([1.0]),
+                            0.0, 0.0) == 0.0
+
+
+def test_moliere_two_radii():
+    # 90 hits at r=1, 10 hits at r=10; 90% containment -> radius 1
+    x = np.concatenate([np.ones(90), 10 * np.ones(10)])
+    y = np.zeros(100)
+    w = np.ones(100)
+    assert abs(m.moliere_radius(x, y, w, 0.0, 0.0, 0.90) - 1.0) < 1e-9
+
+
+def test_core_hits_per_layer_drops_out_of_core_hits():
+    # Two hits in layer 0: one on the barycentre, one 100 mm away.
+    slab = np.array([0, 0, 1])
+    x = np.array([0.0, 100.0, 1.0])
+    y = np.zeros(3)
+    n = m.core_hits_per_layer(slab, x, y, 0.0, 0.0, 3, radius_mm=30.0)
+    assert list(n) == [1, 1, 0]           # the 100 mm hit does not count
+
+
+def test_shower_features_shower():
+    # rising profile peaking at layer 5, then falling
+    profile = np.array([0, 1, 4, 8, 14, 20, 12, 6, 2, 0,
+                        0, 0, 0, 0, 0], dtype=float)
+    # Dense core from layer 2 on: the onset is the first run of two layers
+    # with >= 4 core hits.
+    core = np.array([0, 1, 4, 8, 14, 20, 12, 6, 2, 0,
+                     0, 0, 0, 0, 0], dtype=int)
+    f = m.shower_features(profile, threshold=5.0, max_min=10.0, start_frac=0.1,
+                          core_hits=core, hits_layer=profile)
+    assert f.is_shower is True
+    assert f.max_layer == 5.0 and f.max_value == 20.0
+    assert f.start_layer == 3.0           # first layer > 5 before the peak
+    assert f.end_layer == 7.0             # last layer > 5 after the peak
+    assert f.length == 5.0                # layers 3,4,5,6,7 are > 5
+    assert f.onset == 2.0                 # layers 2 and 3 are the first dense pair
+    assert f.n_layers_before_onset == 1.0  # only layer 1 has hits ahead of it
+
+
+def test_shower_features_mip():
+    # flat MIP-like profile (a couple of hits per layer): not a shower
+    profile = np.full(15, 2.0)
+    core = np.full(15, 2, dtype=int)
+    f = m.shower_features(profile, threshold=5.0, max_min=10.0,
+                          core_hits=core, hits_layer=profile)
+    assert f.is_shower is False
+    assert math.isnan(f.start_layer) and math.isnan(f.max_layer)
+    assert math.isnan(f.onset) and math.isnan(f.n_layers_before_onset)
+
+
+def test_shower_onset_needs_consecutive_dense_layers():
+    # A single dense layer (a delta ray) surrounded by MIP-level occupancy must
+    # not open a shower, however tall the profile peak is.
+    profile = np.array([2, 2, 40, 2, 2] + [2] * 10, dtype=float)
+    core = np.array([1, 1, 40, 1, 1] + [1] * 10, dtype=int)
+    assert m.shower_onset(core, profile, max_min=10.0) == -1
+    # Two in a row does.
+    core2 = np.array([1, 1, 40, 8, 1] + [1] * 10, dtype=int)
+    assert m.shower_onset(core2, profile, max_min=10.0) == 2
+
+
+def test_shower_onset_finds_a_late_cascade():
+    # A cascade opening in the last layers: no room left for a rising edge, which
+    # is what the previous ascending-pairs criterion needed.
+    profile = np.array([1] * 12 + [30, 40, 20], dtype=float)
+    core = np.array([1] * 12 + [30, 40, 20], dtype=int)
+    assert m.shower_onset(core, profile, max_min=10.0) == 12
+
+
+def test_pad_index_grid():
+    # 32 pads per axis at +-(3.375 + k * 5.53) mm, 6.75 mm gap at 0.
+    centres = np.concatenate([-(3.375 + 5.53 * np.arange(16))[::-1], 3.375 + 5.53 * np.arange(16)])
+    assert list(m.pad_index(centres)) == list(range(32))
+
+
+def test_fractal_dimension_mip_track_is_one():
+    # One pad per layer: N_a = N_1 at every scale -> FD = 0 + 1.
+    slab = np.arange(15)
+    x = np.full(15, 3.375)
+    y = np.full(15, -3.375)
+    assert m.fractal_dimension(slab, x, y) == 1.0
+
+
+def test_fractal_dimension_filled_square():
+    # A fully filled 8 x 8 pad block in one layer: N_a = (8/a)^2 for a dividing
+    # 8 -> log(N_1/N_a)/log(a) = 2 exactly; a = 3, 6 do not tile it evenly.
+    pads = 3.375 + 5.53 * np.arange(8)
+    xx, yy = np.meshgrid(pads, pads)
+    slab = np.zeros(64, dtype=int)
+    fd = m.fractal_dimension(slab, xx.ravel(), yy.ravel(), scales=(2, 4, 8))
+    assert abs(fd - 3.0) < 1e-12
+    assert math.isnan(m.fractal_dimension(np.array([], int), np.array([]), np.array([])))
+
+
+
+def test_min_border_distance():
+    L = m.ACTIVE_HALF_SIZE_MM
+    assert m.min_border_distance(0.0, 0.0) == L                       # centre
+    assert abs(m.min_border_distance(-50.0, 52.0) - (L - 52.0)) < 1e-12  # nearest edge is y
+    assert abs(m.min_border_distance(80.0, -80.0) - (L - 80.0)) < 1e-12  # corner
+    assert m.min_border_distance(L, 0.0) == 0.0                         # on the edge
+    assert m.min_border_distance(L + 1.0, 0.0) < 0                      # outside
+    assert m.min_border_distance(10.0, 0.0, half_x=20.0, half_y=50.0) == 10.0
+    assert math.isnan(m.min_border_distance(float("nan"), float("nan")))  # no barycenter
+
+
+def _run_standalone():
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for fn in fns:
+        fn()
+        print(f"  ok  {fn.__name__}")
+    print(f"\nAll {len(fns)} metric tests passed.")
+
+
+if __name__ == "__main__":
+    _run_standalone()

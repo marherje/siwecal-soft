@@ -1,0 +1,9 @@
+# Settings for the event viewer on simulation output (event_viewer/launch_sim.sh sets SIWECAL_SETTINGS to it).
+# Relative paths resolve against the repo root. Everything else as settings.example.yml.
+data_dir:
+  - ./work                                                   # local samples (e.g. run_pid_sim.sh -> work/mu_beam)
+  - /eos/experiment/drdcalo/siw-ecal/TB2026-06/Simulation/Processed
+geometry_dir: ./common/mappings
+pid_dir: null
+cache_dir: null
+output_dir: ./work/viewer_output

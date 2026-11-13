@@ -1,0 +1,438 @@
+#!/usr/bin/env python
+"""
+Generate the full raw -> EDM4hep Condor pipeline for any number of runs, as one
+DAG: CONVERT (one job per raw chunk, all in parallel) then RECO (one job per
+run: event building + PID).
+
+Why a DAG and not the serial drivers (gaudi_jobs/run_full_pipeline_*.py). Those
+decode every raw chunk of a run inside ONE k4run process and write a single
+multi-GB siwecaldecoded file, which the event builder then reads. That file is
+pure overhead:
+
+  * it doubles the decoded data on EOS (~10 GB for one physics run, ~390 GB
+    across the calibration runs) for something no analysis ever opens;
+  * writing it is serial, so a run takes ~20 min of wall clock that 300 parallel
+    chunk jobs do in a couple of minutes;
+  * closing a 10 GB file over XRootD times out often enough to be a real
+    operational problem (it stalled run_000013 three times in one night), and a
+    failed Close leaves a 0-byte file that fails the next stage;
+  * past ~100 GB it is not even possible: ROOT's TTree::fgMaxTreeSize rolls the
+    tree over into a second file, which no merger can produce as one file.
+
+So: decode chunks in parallel, keep them, and let the event builder chain them
+(EcalEventBuilder's InputFiles). The per-run OUTPUT is still exactly one
+ecal_<run>.root and one ecal_<run>.edm4hep.root -- only the intermediate merge
+disappears.
+
+Layout, per run. Decoded chunks are DATA and stay under --converted-dir;
+everything the reconstruction produces goes to --reco-dir, one folder per run:
+
+    Data/rundata_converted_gaudi/<RUN>/chunks/chunk_0000.root ...  decoded (CONVERT)
+    Reconstruction/<RUN>/ecal_<RUN>.root                           event-built (RECO)
+    Reconstruction/<RUN>/ecal_<RUN>.edm4hep.root                   PID/EDM4hep (RECO)
+
+The validation writes its plots/results into that same Reconstruction/<RUN>/
+(siwecal_common.paths.output_dir defaults to the reconstruction base and the
+validation labels each sample by run name), so a run's reconstructed events and
+the plots made from them live together, and the whole area can be regenerated
+from Data/ without ever writing there.
+
+Calibration tables are resolved per run from its own ThresholdDAC (read from the
+run's Run_Settings.txt), exactly as the serial drivers do, so runs taken at
+different thresholds can be submitted together.
+
+Only WRITES files -- never calls condor_submit itself.
+
+Usage::
+
+    python data_conversion/jobs/condor/generate_reco_dag.py \\
+        --runs TB2026CERN_run_000012,TB2026CERN_run_000013 \\
+        --out-dir data_conversion/jobs/condor/generated/physics
+
+    condor_submit_dag data_conversion/jobs/condor/generated/physics/reco.dag
+"""
+import argparse
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+# sibling helper modules of the data-conversion jobs (not packages)
+sys.path.insert(0, os.path.join(_HERE, "..", "calibration"))
+sys.path.insert(0, os.path.join(_HERE, "..", "calibration", "condor"))
+
+from calib_run_utils import parse_run_folder_list, raw_chunk_files
+from condor_common import DEFAULT_CONVERTED_DIR, OPTIONS_DIR, PID_OPTIONS_DIR, chunks_dir, condor_log_dir, env_wrapper_preamble, \
+    mkdirs_line, write_executable, write_text
+from siwecal_common import paths
+from siwecal_eventbuilder.calib_files import (GAUDI_CALIB_DIR, MIP_CALIB_TH, PED_CALIB_TH, calib_th_arg, read_gain_anchor,
+                                     resolve_gaudi_calib_files)
+from siwecal_eventbuilder.geometry import load_slab_technology
+from siwecal_eventbuilder.run_settings import read_threshold_dac
+
+_CLEANUP = os.path.join(_REPO, "data_conversion", "jobs", "calibration", "condor", "cleanup_job_logs.sh")
+
+
+def _convert_sh(out_dir):
+    # A job decodes a GROUP of chunks, each in its own k4run process.
+    #
+    # Why a group and not one chunk per job: a Condor job costs ~14 s of fixed
+    # overhead (slot, CVMFS, sourcing key4hep) to do ~1.5 s of decoding. At one
+    # chunk per job that overhead is paid 11,432 times for a campaign, and 11k
+    # queued jobs are themselves the bottleneck -- most sit idle waiting for a
+    # slot. Twenty chunks per job pays it 572 times instead, and each job still
+    # finishes in under a minute.
+    #
+    # Why still one k4run PER CHUNK inside the job, rather than handing all
+    # twenty to one decoder: it keeps the output exactly one chunk_NNNN.root per
+    # raw chunk, so nothing downstream (the event builder's glob, the calibration
+    # Fill) changes. Feeding several raw files to a single decoder does work --
+    # verified, it is not the data-loss risk it was once thought to be -- but it
+    # would collapse the output into one file per group for a couple of seconds
+    # per chunk, which is not worth the churn.
+    content = f"""#!/bin/bash
+set -eo pipefail
+# convert.sh <grouplist> <run_settings>
+#   grouplist: text file, one "<raw_chunk> <out_decoded>" pair per line
+GROUPLIST="$1"; RUN_SETTINGS="$2"
+
+""" + env_wrapper_preamble() + f"""
+N=0; SKIPPED=0
+while read -r CHUNK OUT_DECODED; do
+  [ -z "$CHUNK" ] && continue
+  # Idempotent: a chunk already decoded is left alone, so a partial submit can
+  # simply be resubmitted (and a DAG rescue re-runs only what is missing).
+  #
+  # "Already decoded" means the ROOT file OPENS and has the tree -- not merely
+  # that it is non-empty. A k4run killed mid-write (OOM, eviction, an XRootD
+  # Close that timed out) leaves a multi-MB file with NO KEYS in it, which a
+  # `[ -s ]` test happily accepts. Those files then sail through every later
+  # stage until the calibration Fill finally chokes on them ("Tree
+  # 'siwecaldecoded' not found"), hours and thousands of jobs later. Verify the
+  # file, not its size.
+  if [ -s "$OUT_DECODED" ] && python3 -c "import ROOT,sys; ROOT.gErrorIgnoreLevel=ROOT.kFatal; f=ROOT.TFile.Open(sys.argv[1]); sys.exit(0 if f and not f.IsZombie() and f.Get('siwecaldecoded') else 1)" "$OUT_DECODED" >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED+1))
+    continue
+  fi
+""" + "  " + mkdirs_line('$(dirname "$OUT_DECODED")') + f"""
+  RAW_FILES="$CHUNK" RAW2ROOT_OUT="$OUT_DECODED" RAW2ROOT_RUN_SETTINGS_FILE="$RUN_SETTINGS" \\
+    k4run "{OPTIONS_DIR}/run_raw2root.py"
+  # And check what we just wrote, before calling it done.
+  if ! python3 -c "import ROOT,sys; ROOT.gErrorIgnoreLevel=ROOT.kFatal; f=ROOT.TFile.Open(sys.argv[1]); sys.exit(0 if f and not f.IsZombie() and f.Get('siwecaldecoded') else 1)" "$OUT_DECODED" >/dev/null 2>&1; then
+    echo "ERROR: $OUT_DECODED was written but has no siwecaldecoded tree" >&2
+    exit 1
+  fi
+  N=$((N+1))
+done < "$GROUPLIST"
+echo "decoded $N chunk(s), skipped $SKIPPED already done"
+"""
+    write_executable(os.path.join(out_dir, "convert.sh"), content)
+
+
+def _reco_sh(out_dir):
+    # One job per run: event building (chaining that run's chunks) then PID.
+    # Two k4run processes, not one: EcalToEDM4hep/EcalShowerVariables are
+    # k4FWCore components whose EvtMax must be fixed before the process starts,
+    # and that count is only known once the event builder has run. run_pid.py
+    # reads it from the ecal file itself, so no driver is needed in between.
+    content = f"""#!/bin/bash
+set -eo pipefail
+# reco.sh <run> <chunks_glob> <ecal_out> <pid_out> <ped> <mip> <ped_lg> <mip_lg> <padmap> <padmap_ovr> <slab_z> <run_id> <hit_selection> <chip_noise_veto> <single_run_only> <hit_mip_cut> <gain_ratio> <gain_intercept>
+RUN="$1"; CHUNKS="$2"; ECAL_OUT="$3"; PID_OUT="$4"
+PED="$5"; MIP="$6"; PED_LG="$7"; MIP_LG="$8"
+PADMAP="$9"; PADMAP_OVR="${{10}}"; SLAB_Z="${{11}}"; RUN_ID="${{12}}"
+HIT_SELECTION="${{13:-hitbit}}"; CHIP_NOISE_VETO="${{14:-1}}"; SINGLE_RUN_ONLY="${{15:-0}}"; HIT_MIP_CUT="${{16:--1}}"
+# LG->HG anchor line; "-" = the steering default
+GAIN_RATIO="${{17:--}}"; GAIN_INTERCEPT="${{18:--}}"
+[ "$GAIN_RATIO" != "-" ] && export EVBLD_GAIN_RATIO="$GAIN_RATIO"
+[ "$GAIN_INTERCEPT" != "-" ] && export EVBLD_GAIN_INTERCEPT="$GAIN_INTERCEPT"
+
+""" + env_wrapper_preamble() + f"""
+""" + mkdirs_line('$(dirname "$ECAL_OUT")') + f"""
+echo "[reco] $RUN: event building from $CHUNKS"
+EVBLD_INPUT_FILES="$CHUNKS" \\
+EVBLD_OUTPUT="$ECAL_OUT" \\
+EVBLD_RUN_ID="$RUN_ID" \\
+EVBLD_PEDESTAL_FILE="$PED" \\
+EVBLD_MIP_FILE="$MIP" \\
+EVBLD_PEDESTAL_FILE_LOWGAIN="$PED_LG" \\
+EVBLD_MIP_FILE_LOWGAIN="$MIP_LG" \\
+EVBLD_PADMAP_DEFAULT="$PADMAP" \\
+EVBLD_PADMAP_SLAB_OVERRIDES="$PADMAP_OVR" \\
+EVBLD_SLAB_Z_FILE="$SLAB_Z" \\
+EVBLD_HIT_SELECTION="$HIT_SELECTION" \\
+EVBLD_CHIP_NOISE_VETO="$CHIP_NOISE_VETO" \\
+EVBLD_SINGLE_RUN_ONLY="$SINGLE_RUN_ONLY" \\
+  k4run "{OPTIONS_DIR}/run_event_builder.py"
+
+echo "[reco] $RUN: PID/EDM4hep -> $PID_OUT"
+ECAL_FILE="$ECAL_OUT" ECAL_PID_OUT="$PID_OUT" ECAL_HIT_MIP_CUT="$HIT_MIP_CUT" \\
+  k4run "{PID_OPTIONS_DIR}/run_pid.py"
+
+echo "[reco] $RUN: done"
+"""
+    write_executable(os.path.join(out_dir, "reco.sh"), content)
+
+
+def _validate_sh(out_dir):
+    # One job per run. --results-id is passed explicitly: the validation would
+    # otherwise pick the next id free on disk, and every job running at the same
+    # time would pick the SAME one and overwrite the others' results table.
+    content = f"""#!/bin/bash
+set -eo pipefail
+# validate.sh <run> <ecal_file> <out_base> <results_id>
+RUN="$1"; ECAL="$2"; OUT_BASE="$3"; RESULTS_ID="$4"
+
+""" + env_wrapper_preamble() + f"""
+echo "[validate] $RUN: $ECAL -> $OUT_BASE/$RUN/"
+python3 -m siwecal_validation --file "$ECAL" --run "$RUN" \\
+    --out "$OUT_BASE" --results-id "$RESULTS_ID"
+"""
+    write_executable(os.path.join(out_dir, "validate.sh"), content)
+
+
+def _validate_sub(out_dir, log_dir, request_memory, job_flavour):
+    content = f"""universe                = vanilla
+executable              = {out_dir}/validate.sh
+arguments               = "$(run) $(ecal) $(out_base) $(results_id)"
+log                     = {log_dir}/validate_$(run).log
+output                  = {log_dir}/validate_$(run).out
+error                   = {log_dir}/validate_$(run).err
+request_cpus            = 1
+request_memory          = ifthenelse(NumJobStarts <= 0, {request_memory}, {request_memory} * (NumJobStarts + 1))
+request_disk            = 4000M
+should_transfer_files   = NO
+getenv                  = False
+periodic_release        = (JobStatus == 5) && (HoldReasonCode == 34) && (NumJobStarts < 5)
++JobFlavour             = "{job_flavour}"
+queue
+"""
+    write_text(os.path.join(out_dir, "validate.sub"), content)
+
+
+def _convert_sub(out_dir, log_dir, run, request_memory, job_flavour):
+    content = f"""universe                = vanilla
+executable              = {out_dir}/convert.sh
+arguments               = "$(grouplist) $(run_settings)"
+log                     = {log_dir}/convert_{run}_$(Process).log
+output                  = {log_dir}/convert_{run}_$(Process).out
+error                   = {log_dir}/convert_{run}_$(Process).err
+request_cpus            = 1
+request_memory          = ifthenelse(NumJobStarts <= 0, {request_memory}, {request_memory} * (NumJobStarts + 1))
+request_disk            = 4000M
+should_transfer_files   = NO
+getenv                  = False
+periodic_release        = (JobStatus == 5) && (HoldReasonCode == 34) && (NumJobStarts < 5)
++JobFlavour             = "{job_flavour}"
+queue grouplist,run_settings from {out_dir}/grouplist_{run}.txt
+"""
+    write_text(os.path.join(out_dir, f"convert_{run}.sub"), content)
+
+
+def _reco_sub(out_dir, log_dir, request_memory, job_flavour):
+    content = f"""universe                = vanilla
+executable              = {out_dir}/reco.sh
+arguments               = "$(run) '$(chunks)' $(ecal_out) $(pid_out) $(ped) $(mip) $(ped_lg) $(mip_lg) $(padmap) $(padmap_ovr) $(slab_z) $(run_id) $(hit_selection) $(chip_noise_veto) $(single_run_only) $(hit_mip_cut) $(gain_ratio) $(gain_intercept)"
+log                     = {log_dir}/reco_$(run).log
+output                  = {log_dir}/reco_$(run).out
+error                   = {log_dir}/reco_$(run).err
+request_cpus            = 1
+request_memory          = ifthenelse(NumJobStarts <= 0, {request_memory}, {request_memory} * (NumJobStarts + 1))
+request_disk            = 8000M
+should_transfer_files   = NO
+getenv                  = False
+periodic_release        = (JobStatus == 5) && (HoldReasonCode == 34) && (NumJobStarts < 5)
++JobFlavour             = "{job_flavour}"
+queue
+"""
+    write_text(os.path.join(out_dir, "reco.sub"), content)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Generate the CONVERT+RECO Condor DAG (raw -> ecal -> EDM4hep).")
+    p.add_argument("--runs", required=True,
+                   help="Comma-separated run folder path(s) or bare run name(s).")
+    p.add_argument("--raw-base", default=None, help="Base dir to resolve bare run names against.")
+    p.add_argument("--converted-dir", default=DEFAULT_CONVERTED_DIR,
+                   help=f"Where the decoded <RUN>/chunks/ go. Default: {DEFAULT_CONVERTED_DIR}")
+    p.add_argument("--reco-dir", default=paths.reconstruction_dir(),
+                   help=f"Where <RUN>/ecal_*.root go (outside Data/). "
+                        f"Default: {paths.reconstruction_dir()}")
+    p.add_argument("--mip-th", type=calib_th_arg, default=MIP_CALIB_TH,
+                   help=f"Threshold whose MIP tables every run is calibrated against. Default: {MIP_CALIB_TH}, as "
+                        "the final campaign; 'own' = the run's own threshold.")
+    p.add_argument("--ped-th", type=calib_th_arg, default=PED_CALIB_TH,
+                   help=f"Threshold whose PEDESTAL tables (and so pedestal mask) every run uses. Default: "
+                        f"{PED_CALIB_TH}, as the final campaign; 'own' = the run's own threshold.")
+    p.add_argument("--calib-dir", default=GAUDI_CALIB_DIR,
+                   help="Calibration folder with the MuonCalib layout ({pedestals,mips,anchor}/th<N>/). "
+                        f"Default: the official tables on EOS, {GAUDI_CALIB_DIR}.")
+    p.add_argument("--anchor-own-th", action="store_true", default=True,
+                   help="Take the LG->HG anchor line of the run's OWN threshold folder (default). The line is a "
+                        "property of the data-taking period (th210 eudaq 166: k 0.0924; th220 run 72: 0.0964; "
+                        "th230 run 12: 0.0958). Kept for old command lines.")
+    p.add_argument("--anchor-from-ped-th", dest="anchor_own_th", action="store_false",
+                   help="Take the anchor line of the --ped-th folder instead (before 2026-09-30).")
+    p.add_argument("--out-dir", required=True, help="Directory to write the DAG, subs, wrappers and logs into.")
+    p.add_argument("--chunks-per-job", type=int, default=20,
+                   help="Raw chunks decoded by ONE Condor job, each in its own k4run (default 20). "
+                        "A job costs ~14s of fixed overhead (slot, CVMFS, key4hep) for ~1.5s of "
+                        "decoding, so one chunk per job wastes ~90%% of the farm time it uses and "
+                        "floods the schedd; 20 keeps jobs under a minute and cuts both by ~8x.")
+    p.add_argument("--convert-request-memory", type=int, default=2000,
+                   help="request_memory in MB for a CONVERT job (default 2000). Measured peak RSS of a "
+                        "chunk decode is ~790 MB -- including run_000004's chunk 0100, the sparse muon "
+                        "chunk that used to peak at 22.7 GB and OOM-kill the job. That is what the old "
+                        "7000 was sized for; e74be8b made the decoder stream acquisitions into the tree "
+                        "instead of buffering a whole file, and the request was never brought back down. "
+                        "Asking 9x what you use does not just waste the farm -- it starves you of slots: "
+                        "few machines have 7 GB free per core, so 532 queued jobs were getting 12.")
+    p.add_argument("--reco-request-memory", type=int, default=8000,
+                   help="request_memory in MB for a RECO job (event building holds a run's events in memory).")
+    p.add_argument("--convert-job-flavour", default="microcentury", help="+JobFlavour for CONVERT (default 1h).")
+    p.add_argument("--reco-job-flavour", default="workday", help="+JobFlavour for RECO (default 8h).")
+    p.add_argument("--convert-only", action="store_true",
+                   help="Only decode the raw chunks; no RECO, no VALIDATE. Use this to convert a "
+                        "whole campaign up front (the calibration Fill needs nothing else), then "
+                        "run the per-threshold reco DAGs afterwards -- their CONVERT nodes find the "
+                        "chunks already decoded and fall straight through to RECO.")
+    p.add_argument("--no-validation", action="store_true",
+                   help="Stop after RECO; do not run the validation stage.")
+    p.add_argument("--validate-request-memory", type=int, default=6000,
+                   help="request_memory in MB for a VALIDATE job.")
+    p.add_argument("--validate-job-flavour", default="workday", help="+JobFlavour for VALIDATE (default 8h).")
+    p.add_argument("--hit-selection", default="hitbit", choices=("hitbit", "adc"),
+                   help="EcalEventBuilder.HitSelection for every RECO job: 'hitbit' (historical) or 'adc' "
+                        "(hit bit in any SCA of the window OR adc - pedestal > 30 ADC; see BuilderConfig::hitSelection). "
+                        "A campaign with 'adc' belongs in its own --reco-dir: the energy scale is 17-20%% higher.")
+    p.add_argument("--chip-noise-veto", dest="chip_noise_veto", action="store_true", default=True,
+                   help="EcalEventBuilder.ChipNoiseVeto for every RECO job (drop chip trigger bursts; see "
+                        "BuilderConfig::chipNoiseVeto). ON by default; --no-chip-noise-veto reproduces the "
+                        "campaigns made before 2026-09-20.")
+    p.add_argument("--no-chip-noise-veto", dest="chip_noise_veto", action="store_false")
+    p.add_argument("--single-run-only", action="store_true",
+                   help="EcalEventBuilder.SingleRunOnly for every RECO job: write only the events that are the "
+                        "single event built from their DAQ acquisition (single_run == 1). Belongs in its own "
+                        "--reco-dir (e.g. Reconstructed_singlerun).")
+    p.add_argument("--hit-mip-cut", type=float, default=0.5,
+                   help="ECAL_HIT_MIP_CUT of the PID stage: drop hits below this energy [MIP] from the EDM4hep "
+                        "output (and every ECalPid variable). Default 0.5, as the final campaign, run_pid_batch.py "
+                        "in physics mode and the simulation; -1 = off.")
+    p.add_argument("--keep-job-logs", action="store_true",
+                   help="Keep every job's .out/.err. By default they are deleted when the node succeeds, to "
+                        "protect the AFS logs/ directory's entry limit (see calibration/condor/README.md).")
+    args = p.parse_args(argv)
+
+    kwargs = {"default_base": args.raw_base} if args.raw_base else {}
+    run_folders = parse_run_folder_list(args.runs, **kwargs)
+
+    out_dir = os.path.abspath(args.out_dir)
+    log_dir = condor_log_dir(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    mappings = paths.geometry_dir()
+    padmap = os.path.join(mappings, "fev10_rotate_chip_channel_x_y_mapping.txt")
+    # One slab file for everything: z, W, and the technology block that says
+    # which slab needs its own pad map (slab 12, the FEV11 chip-on-board).
+    slab_z = os.path.join(mappings, "slab_z_positions.yml")
+    padmap_ovr = load_slab_technology(slab_z, mappings).pad_map_overrides_env()
+
+    dag = []
+    for results_id, (run, raw_dir) in enumerate(run_folders, 1):
+        raw_chunks = raw_chunk_files(raw_dir, run)
+        if not raw_chunks:
+            print(f"ERROR: no raw chunks for {run} in {raw_dir}", file=sys.stderr)
+            return 1
+        run_settings = os.path.join(raw_dir, "Run_Settings.txt")
+
+        th = read_threshold_dac(run_settings)
+        if th < 0:
+            print(f"ERROR: cannot read ThresholdDAC from {run_settings}", file=sys.stderr)
+            return 1
+        # In --convert-only mode the calibration tables need not exist yet: that is
+        # the whole point of converting first and calibrating (e.g. th210) after.
+        if args.convert_only:
+            ped = mip = ped_lg = mip_lg = ""
+            anchor = ("-", "-")
+        else:
+            anchor = read_gain_anchor(args.calib_dir, th if args.anchor_own_th else (args.ped_th or th))
+            ped, mip, ped_lg, mip_lg = resolve_gaudi_calib_files(th, mip_th=args.mip_th, ped_th=args.ped_th,
+                                                                calib_dir=args.calib_dir and os.path.abspath(args.calib_dir))
+
+        cdir = chunks_dir(args.converted_dir, run)
+        os.makedirs(cdir, exist_ok=True)
+        # One file per GROUP of chunks-per-job, each listing "<raw> <decoded>"
+        # pairs; the .sub queues one job per group file.
+        groups_dir = os.path.join(out_dir, "groups")
+        os.makedirs(groups_dir, exist_ok=True)
+        pairs = [(c, os.path.join(cdir, f"chunk_{i:04d}.root")) for i, c in enumerate(raw_chunks)]
+        rows = []
+        for g, start in enumerate(range(0, len(pairs), args.chunks_per_job)):
+            group = pairs[start:start + args.chunks_per_job]
+            gpath = os.path.join(groups_dir, f"{run}_g{g:04d}.txt")
+            write_text(gpath, "\n".join(f"{raw} {out}" for raw, out in group) + "\n")
+            rows.append(f"{gpath},{run_settings}")
+        write_text(os.path.join(out_dir, f"grouplist_{run}.txt"), "\n".join(rows) + "\n")
+        n_jobs = len(rows)
+        _convert_sub(out_dir, log_dir, run, args.convert_request_memory, args.convert_job_flavour)
+
+        digits = "".join(ch for ch in run.split("_")[-1] if ch.isdigit())
+        run_id = int(digits) if digits else -1
+        rdir = os.path.join(args.reco_dir, run)
+        os.makedirs(rdir, exist_ok=True)
+        ecal_out = os.path.join(rdir, f"ecal_{run}.root")
+        pid_out = os.path.join(rdir, f"ecal_{run}.edm4hep.root")
+
+        dag.append(f"JOB convert_{run} {out_dir}/convert_{run}.sub")
+        dag.append(f"RETRY convert_{run} 3")
+        if args.convert_only:
+            dag.append("")
+            print(f"[{run}] th={th}  {len(raw_chunks)} chunk(s) in {n_jobs} job(s) -> {cdir}/   (convert only)")
+            continue
+        dag.append(f"JOB reco_{run} {out_dir}/reco.sub")
+        dag.append(
+            f'VARS reco_{run} run="{run}" chunks="{os.path.join(cdir, "chunk_*.root")}" '
+            f'ecal_out="{ecal_out}" pid_out="{pid_out}" ped="{ped}" mip="{mip}" '
+            f'ped_lg="{ped_lg}" mip_lg="{mip_lg}" padmap="{padmap}" '
+            f'padmap_ovr="{padmap_ovr}" slab_z="{slab_z}" run_id="{run_id}" '
+            f'hit_selection="{args.hit_selection}" chip_noise_veto="{1 if args.chip_noise_veto else 0}" '
+            f'single_run_only="{1 if args.single_run_only else 0}" hit_mip_cut="{args.hit_mip_cut}" '
+            f'gain_ratio="{anchor[0]}" gain_intercept="{anchor[1]}"')
+        dag.append(f"RETRY reco_{run} 2")
+        dag.append(f"PARENT convert_{run} CHILD reco_{run}")
+        if not args.keep_job_logs:
+            dag.append(f"SCRIPT POST reco_{run} {_CLEANUP} $RETURN {os.path.join(log_dir, f'reco_{run}')}")
+
+        if not args.no_validation:
+            dag.append(f"JOB validate_{run} {out_dir}/validate.sub")
+            dag.append(f'VARS validate_{run} run="{run}" ecal="{ecal_out}" '
+                       f'out_base="{args.reco_dir}" results_id="{results_id}"')
+            dag.append(f"RETRY validate_{run} 2")
+            dag.append(f"PARENT reco_{run} CHILD validate_{run}")
+            if not args.keep_job_logs:
+                dag.append(f"SCRIPT POST validate_{run} {_CLEANUP} $RETURN "
+                           f"{os.path.join(log_dir, f'validate_{run}')}")
+        dag.append("")
+
+        print(f"[{run}] th={th}  {len(raw_chunks)} chunk(s) in {n_jobs} job(s) -> {cdir}/  reco -> {rdir}/")
+        print(f"          calib: {os.path.basename(ped)} / {os.path.basename(mip)}"
+              f"{'' if ped_lg else '   (no low-gain tables: no saturation recovery)'}")
+
+    _convert_sh(out_dir)
+    if not args.convert_only:
+        _reco_sh(out_dir)
+        _reco_sub(out_dir, log_dir, args.reco_request_memory, args.reco_job_flavour)
+    if not args.convert_only and not args.no_validation:
+        _validate_sh(out_dir)
+        _validate_sub(out_dir, log_dir, args.validate_request_memory, args.validate_job_flavour)
+    # convert-only and the full pipeline coexist in one per-threshold folder, so
+    # they must not write the same file name.
+    dag_path = os.path.join(out_dir, "convert.dag" if args.convert_only else "reco.dag")
+    write_text(dag_path, "\n".join(dag) + "\n")
+    print(f"\n{len(run_folders)} run(s). Submit with:\n  condor_submit_dag {dag_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

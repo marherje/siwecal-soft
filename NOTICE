@@ -1,0 +1,15 @@
+siwecal-soft
+Copyright 2026 the siwecal-soft authors (CITATION.cff)
+
+Licensed under the Apache License, Version 2.0 (see the LICENSE file).
+
+siwecal-soft merges two repositories, frozen at the tag final-before-monorepo:
+  - siwecal-tb2026, Copyright 2026 Olmichu22, Apache License 2.0
+  - siwecal_k4sim (simulation), relicensed under the Apache License 2.0 by its author for this merge
+
+This product includes software developed as part of the SiWECAL
+testbeam analysis effort within the key4hep ecosystem.
+
+Portions of this project are derived from or interoperate with:
+  - SiWECAL-TB-analysis (CALICE/SiW-ECAL testbeam analysis)
+  - key4hep (https://key4hep.github.io/)

@@ -1,0 +1,39 @@
+# build products
+build/
+install/
+# local work: generated DAGs, condor logs, test samples (simulation/campaign/make_sim_dag.py writes work/condor_<campaign>)
+work/
+condor_*/
+out_*/
+# environments and per-user settings
+.venv/
+settings.yml
+config.yml
+# data and outputs never live in the repo (EOS); figures are made, not versioned
+*.root
+*.slcio
+*.npz
+*.npy
+*.pkl
+*.png
+*.pdf
+*.log
+*.out
+*.err
+logs/
+core
+core.*
+# python / tools
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.ruff_cache/
+# editors, personal tooling
+.cache/
+.idea/
+.vscode/
+.claude/
+.mcp.json
+/*.cc

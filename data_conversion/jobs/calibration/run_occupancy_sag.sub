@@ -1,0 +1,16 @@
+# The three official sag maps with OccupancySagCalibrator, one job per threshold set (its runs in sequence, chunks
+# 10-17 as the maps in common/mappings were made). From the repo root, init_siwecalsoft.sh sourced:
+#   mkdir -p work/occupancy_sag && condor_submit data_conversion/jobs/calibration/run_occupancy_sag.sub
+# then compare with the committed maps:
+#   for t in th210 th220 th230; do diff <(grep -v '^#' common/mappings/occupancy_sag_$t.txt) \
+#                                       <(grep -v '^#' work/occupancy_sag/occupancy_sag_$t.txt); done
+universe       = vanilla
+executable     = /bin/bash
+arguments      = -c "source $ENV(SIWECAL_SOFT_ROOT)/init_siwecalsoft.sh --no-venv --quiet && python3 $ENV(SIWECAL_SOFT_ROOT)/data_conversion/jobs/calibration/run_occupancy_sag.py $ENV(SIWECAL_SOFT_ROOT)/work/occupancy_sag --sets $(set)"
+output         = $ENV(SIWECAL_SOFT_ROOT)/work/occupancy_sag/$(set).out
+error          = $ENV(SIWECAL_SOFT_ROOT)/work/occupancy_sag/$(set).err
+log            = $ENV(SIWECAL_SOFT_ROOT)/work/occupancy_sag/sag.log
+request_memory = 4000
+getenv         = False
++JobFlavour    = "workday"
+queue set in (th210, th220, th230)

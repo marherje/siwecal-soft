@@ -1,0 +1,15 @@
+# siwecal-soft is built with CMake (./build.sh) and its Python packages are put on PYTHONPATH by
+# init_siwecalsoft.sh; this file only configures the tools.
+[tool.pytest.ini_options]
+# Gaudi's CTest pytest plugins conflict with standalone pytest runs
+# (collect_for_ctest: 'Session' has no 'ctest_args').
+addopts = "-p no:collect_for_ctest -p no:ctest_measurements_reporter -p no:gaudi_fixtures"
+testpaths = ["tests", "common/tests", "analysis/tests", "analysis/python/siwecal_validation/tests",
+             "data_conversion/tests/python"]
+# the packages import without init_siwecalsoft.sh too (CI, an editor's test runner)
+pythonpath = [".", "common/python", "data_conversion/python", "analysis/python"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["build", "install", "work"]

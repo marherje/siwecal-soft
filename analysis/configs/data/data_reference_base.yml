@@ -1,0 +1,50 @@
+# Data root for every run listed below. When set, this WINS over settings.yml
+# (data_dir): the convenient single place to point a whole run list at your data.
+# Left commented => fall back to settings.yml. A per-entry absolute path always
+# wins over this, and files not found here fall back to the settings.yml roots.
+# main_path: /path/to/your/TB2026CERN/data
+pedestrial_and_mip: "./calibration"
+data:
+  P1_99GeV: [TB2026CERN_run_000058]
+  P1_74GeV: [TB2026CERN_run_000007]
+  P1_52GeV: [TB2026CERN_run_000013]
+  P1_34GeV: [TB2026CERN_run_000015]
+  P1_20GeV: [TB2026CERN_run_000020]
+  P1_10GeV: [TB2026CERN_run_000021]
+  P1_7_5GeV: [TB2026CERN_run_000022]
+
+  P2_7_5GeV: [TB2026CERN_run_000023, TB2026CERN_run_000024]
+  P2_10GeV: [TB2026CERN_run_000025]
+  P2_20GeV: [TB2026CERN_run_000026]
+  P2_34GeV: [TB2026CERN_run_000027]
+  P2_52GeV: [TB2026CERN_run_000028]
+  P2_74GeV: [TB2026CERN_run_000029]
+
+  P3_74GeV: [TB2026CERN_run_000030]
+  P3_52GeV: [TB2026CERN_run_000031]
+  P3_34GeV: [TB2026CERN_run_000032]
+  P3_20GeV: [TB2026CERN_run_000033, TB2026CERN_run_000034, TB2026CERN_run_000035]
+  P3_10GeV: [TB2026CERN_run_000036]
+  P3_7_5GeV: [TB2026CERN_run_000038,TB2026CERN_run_000039]
+
+
+  P4_7_5GeV: [TB2026CERN_run_000041]
+  P4_10GeV: [TB2026CERN_run_000042]
+  P4_20GeV: [TB2026CERN_run_000043]
+  P4_34GeV: [TB2026CERN_run_000044]
+  P4_52GeV: [TB2026CERN_run_000045]
+  P4_74GeV: [TB2026CERN_run_000046]
+
+  P5_74GeV: [TB2026CERN_run_000047]
+  P5_99GeV: [TB2026CERN_run_000048]
+  P5_52GeV: [TB2026CERN_run_000050]
+  P5_34GeV: [TB2026CERN_run_000051]
+  P5_20GeV: [TB2026CERN_run_000055]
+  P5_10GeV: [TB2026CERN_run_000056]
+  P5_7_5GeV: [TB2026CERN_run_000057]
+
+  74GeVe: [TB2026CERN_run_000286]
+  99GeVe: [TB2026CERN_run_000285]
+
+  muons: [TB2026CERN_run_000004]
+

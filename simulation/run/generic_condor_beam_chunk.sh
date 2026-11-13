@@ -1,0 +1,327 @@
+#!/bin/bash
+# Chunked beam-test simulation + per-chunk digitisation for the SiWECAL PID
+# campaign (e-/mu-/pi- at 74 and 99 GeV, 50k events per point).
+#
+# Difference with generic_condor_beam.sh
+# --------------------------------------
+#   * One condor job = one CHUNK of a point, with its own RNG seed, so a 50k
+#     point is split over many jobs instead of a single ~26 h job.
+#   * The job does ddsim AND the two cheap downstream steps (job3 digitisation
+#     + ACTS tracking + ecal-tree conversion) on the worker's local scratch,
+#     and stages out:
+#         Generated/chunks/output_<chunk_label>.edm4hep.root       (raw sim,
+#                                                        kept for reprocessing)
+#         Processed/chunks/<chunk_label>_ecal.root                 (ecal TTree)
+#         Processed/chunks/<chunk_label>_digitized.edm4hep.root    (digitised
+#                                        hits + ACTSTracks/EMShowers, ONE file:
+#                                        job4 writes its tracks back into
+#                                        digitized.edm4hep.root rather than a
+#                                        separate tracks.edm4hep.root product)
+#   * The per-point pipelines then only have to hadd the small ecal trees and
+#     run SiWEcalPID (see simulation/jobs/pipeline_common.sh).
+#
+# Usage:
+#   ./generic_condor_beam_chunk.sh <nevents> <particle> <energy_GeV>  \
+#                                   <pos_x_mm> <pos_y_mm>             \
+#                                   <sigma_x_mm> <sigma_y_mm>         \
+#                                   <sigma_E_frac> <chunk_id> <seed>
+#
+# Set DRY_RUN=1 to generate the steer/sub files without submitting.
+
+set -uo pipefail
+
+mkdir -p steer log
+
+nevents=$1
+particle=$2
+energy=$3
+pos_x=$4
+pos_y=$5
+sigma_x=$6
+sigma_y=$7
+sigma_E=$8
+chunk=$9
+seed=${10}
+
+PHYSLIST="QGSP_BERT"
+
+# Geometry, as in generic_condor_beam.sh: the H2-like line of the default compact, beam born at -65.5 m; the
+# June-2026 line alone is SND_compact_beamline_v7.xml with BEAM_Z_MM=-2650, the bare detector
+# COMPACT_FILE=SND_compact.xml BEAM_Z_MM=-2000 OUTPUT_TAG=. (The old default here, -2650 with the H2 compact,
+# started the beam downstream of the whole H2 line.) The tag goes into the point label, so geometries never mix.
+COMPACT_FILE=${COMPACT_FILE:-SND_compact_beamline.xml}
+BEAM_Z_MM=${BEAM_Z_MM:--65500}
+OUTPUT_TAG=${OUTPUT_TAG-_beamline_real}
+
+# Digitisation: job3 refuses to run without the threshold set of the data the
+# sample is for, and the chain it runs (real by default, simple on request)
+# decides which collections the tracking and the ecal tree read.
+: "${CALIB_THRESHOLD:?set CALIB_THRESHOLD (th210 / th220 / th230): the threshold set of the data run this sample is for}"
+DIGI_MODE=${DIGI_MODE:-real}
+case "${DIGI_MODE}" in
+    real) TRACK_COLLECTION=SiPadHitsRealDigi; TREE_MASKING=SiPadHitsRealMasked ;;
+    simple) TRACK_COLLECTION=SiPadHitsDigi; TREE_MASKING= ;;
+    *) echo "DIGI_MODE='${DIGI_MODE}' must be real or simple here (both has no single tree)"; exit 1 ;;
+esac
+
+local=$PWD
+repo_root="$(cd "${local}/../.." && pwd)"
+geometry_folder="${local}/../geometry"
+eos_base="/eos/experiment/drdcalo/siw-ecal/TB2026-06/Simulation"
+data_path="${eos_base}/Generated/chunks"
+tree_path="${eos_base}/Processed/chunks"
+steer_path="${local}/steer"
+log_path="${local}/log"
+
+# Point label: identical for every chunk of the same (particle, E, position).
+point=beam_${particle}_${energy}GeV_xy_${pos_x}_${pos_y}_sigx${sigma_x}_sigy${sigma_y}_sigE${sigma_E}${OUTPUT_TAG}
+chunk_tag=$(printf "c%03d" "${chunk}")
+label=${point}_${chunk_tag}
+
+# Run number written to the ecal tree: keeps chunk (and energy) identity after
+# the trees of several chunks - and of 74+99 GeV - are hadd'ed together.
+run_number=$(( energy * 1000 + chunk ))
+
+gpsmac=gps_${PHYSLIST}_${label}.mac
+scriptname=runddsim_${PHYSLIST}_${label}.py
+condorsh=runddsim_${PHYSLIST}_${label}.sh
+condorsub=runddsim_${PHYSLIST}_${label}.sub
+condorfile=runddsim_${PHYSLIST}_${label}
+
+sim_name="output_${label}.edm4hep.root"
+remote_sim="${data_path}/${sim_name}"
+remote_tree="${tree_path}/${label}_ecal.root"
+remote_digitized="${tree_path}/${label}_digitized.edm4hep.root"
+
+sigma_E_GeV=$(python3 -c "print(${energy} * ${sigma_E})")
+
+echo "Chunk ${chunk_tag}: ${particle} ${energy} GeV  centre=(${pos_x},${pos_y}) mm  sigma=(${sigma_x},${sigma_y}) mm  N=${nevents}  seed=${seed}  run=${run_number}"
+
+# --------------------------------------------------
+# GEANT4 GPS MACRO FILE
+# --------------------------------------------------
+{
+echo "/gps/verbose 0"
+echo "/gps/particle ${particle}"
+echo "/gps/direction 0 0 1"
+echo "/gps/ang/rot1 1 0 0"
+echo "/gps/ang/rot2 0 1 0"
+
+# Spatial profile: elliptical Gaussian beam
+echo "/gps/pos/type Beam"
+echo "/gps/pos/shape Circle"
+echo "/gps/pos/centre ${pos_x} ${pos_y} ${BEAM_Z_MM} mm"
+echo "/gps/pos/sigma_x ${sigma_x} mm"
+echo "/gps/pos/sigma_y ${sigma_y} mm"
+
+# Energy distribution
+if (( $(echo "${sigma_E} > 0" | bc -l) )); then
+    echo "/gps/ene/type Gauss"
+    echo "/gps/ene/mono ${energy} GeV"
+    echo "/gps/ene/sigma ${sigma_E_GeV} GeV"
+else
+    echo "/gps/ene/type Mono"
+    echo "/gps/ene/mono ${energy} GeV"
+fi
+
+echo "/run/beamOn ${nevents}"
+} > ${steer_path}/${gpsmac}
+
+# --------------------------------------------------
+# STEERING FILE (PYTHON)
+# --------------------------------------------------
+cat > ${steer_path}/${scriptname} <<EOF
+import os
+from DDSim.DD4hepSimulation import DD4hepSimulation
+from g4units import MeV
+
+# Workaround for DD4hep 1.35 + Python 3.13: addParametersToRunHeader returns
+# a dict that cppyy cannot convert to std::map<string,string>.
+try:
+    from DDSim.Helper.Meta import Meta as _M
+    _M.addParametersToRunHeader = lambda self, dds: {}
+except Exception:
+    pass
+
+compact_path = os.path.abspath("${geometry_folder}/${COMPACT_FILE}")
+if not os.path.isfile(compact_path):
+    raise RuntimeError("Compact file not found: " + compact_path)
+
+SIM = DD4hepSimulation()
+
+# runType="run": simulation driven by --macroFile, not ddsim's internal gun loop.
+SIM.runType   = "run"
+SIM.skipNEvents = 0
+SIM.compactFile  = str(compact_path)
+SIM._compactFile = SIM.compactFile
+SIM.outputFile   = "${sim_name}"
+SIM.physicsList = "${PHYSLIST}"
+
+# Per-chunk RNG seed: without this every chunk of a point would replay the very
+# same ${nevents} events and the 50k sample would be ${nevents} events copied N times.
+SIM.random.seed = ${seed}
+SIM.random.enableEventSeed = True
+
+print("COMPACT FILE  =", SIM.compactFile)
+print("OUTPUT FILE   =", SIM.outputFile)
+print("PARTICLE      = ${particle}")
+print("Energy [GeV]  = ${energy}")
+print("Beam centre   = (${pos_x}, ${pos_y}) mm")
+print("sigma_x [mm]  = ${sigma_x}")
+print("sigma_y [mm]  = ${sigma_y}")
+print("sigma_E [frac]= ${sigma_E}")
+print("chunk         = ${chunk}")
+print("seed          = ${seed}")
+EOF
+
+# --------------------------------------------------
+# CONDOR SHELL SCRIPT
+# --------------------------------------------------
+cat > ${steer_path}/${condorsh} <<EOF
+#!/bin/bash
+# Note: no set -e — ddsim with runType="run"+GPS crashes during Geant4 cleanup
+# even when all events are written. We validate the local output file instead.
+
+echo "Starting chunk job ${label} on \$(hostname)"
+
+source "${repo_root}/init_siwecalsoft.sh" --no-venv --quiet
+
+LOCAL_SIM="${sim_name}"
+LOCAL_TREE="${label}_ecal.root"
+LOCAL_DIGITIZED="digitized.edm4hep.root"
+
+# ---------- 1. Geant4 simulation ----------
+ddsim --enableG4GPS \\
+      --macroFile    ${steer_path}/${gpsmac} \\
+      --steeringFile ${steer_path}/${scriptname} \\
+      &> ${log_path}/${label}.log
+DDSIM_RC=\$?
+
+if [[ ! -f "\${LOCAL_SIM}" ]] || [[ ! -s "\${LOCAL_SIM}" ]]; then
+    echo "ERROR: ddsim (exit \${DDSIM_RC}) produced no usable local output file."
+    exit 1
+fi
+if [[ \${DDSIM_RC} -ne 0 ]]; then
+    echo "WARNING: ddsim exit code \${DDSIM_RC} — Geant4 cleanup crash after all events written. Local output OK."
+fi
+
+# ---------- 2. Stage out the raw sim chunk (before the fragile steps) ----------
+# xrdcp, not a plain cp through the worker's /eos FUSE mount: eosxd write-back
+# caching on ephemeral batch slots can report a successful local write that
+# never reaches the EOS namespace before the slot is torn down.
+LOCAL_SIM_SIZE=\$(stat -c%s "\${LOCAL_SIM}")
+xrdcp --force "\${LOCAL_SIM}" "root://eosexperiment.cern.ch/${remote_sim}"
+if [[ \$? -ne 0 ]]; then
+    echo "ERROR: xrdcp stage-out of the sim chunk failed."
+    exit 1
+fi
+REMOTE_SIM_SIZE=\$(xrdfs eosexperiment.cern.ch stat "${remote_sim}" 2>/dev/null | awk '/Size:/{print \$2}')
+if [[ "\${REMOTE_SIM_SIZE}" != "\${LOCAL_SIM_SIZE}" ]]; then
+    echo "ERROR: sim stage-out verification failed (local=\${LOCAL_SIM_SIZE}, remote='\${REMOTE_SIM_SIZE}')."
+    exit 1
+fi
+echo "Raw sim chunk on EOS: ${remote_sim} (\${REMOTE_SIM_SIZE} bytes)"
+
+# ---------- 3. Digitisation (GeV2MIP + digi + flip + channel mapping) ----------
+# the ecal tree comes out of the same job (EcalTreeWriter)
+CALIB_THRESHOLD=${CALIB_THRESHOLD} DIGI_MODE=${DIGI_MODE} ECAL_TREE_OUTPUT="\${PWD}/\${LOCAL_TREE}" \\
+      ECAL_TREE_RUN=${run_number} ECAL_TREE_MASKING=${TREE_MASKING} \\
+      INPUT_FILE="\${PWD}/\${LOCAL_SIM}" k4run ${repo_root}/simulation/jobs/job3_digitize.py \\
+      &>> ${log_path}/${label}.log
+if [[ ! -s digitized.edm4hep.root ]]; then
+    echo "ERROR: digitisation produced no output (raw sim is safe on EOS, rerun the pipeline stage by hand)."
+    exit 2
+fi
+
+# ---------- 4. ACTS tracking ----------
+# Runs on SiPadHitsDigi, BEFORE the flip: DetectorFlipper rewrites the hit z
+# into the test-beam frame, which no longer matches the ACTS surfaces (those
+# come from the same compact XML as the simulation). Written to a temp file
+# and swapped back onto digitized.edm4hep.root itself (keep * carries the
+# digitised collections forward) so ACTSTracks/EMShowers/SiPadMeasurements end
+# up in the ONE edm4hep file that gets staged, instead of a separate
+# tracks.edm4hep.root product.
+LOCAL_DIGITIZED_TMP="digitized_tracks_tmp.edm4hep.root"
+# Must end in .root (k4FWCore's IOSvc picks its Writer backend off the
+# filename; digitized.edm4hep.root.tracks_tmp made it fail initialisation
+# with "Unknown file type").
+INPUT_FILE="digitized.edm4hep.root" INPUT_COLLECTION="${TRACK_COLLECTION}" \\
+      OUTPUT_FILE="\${LOCAL_DIGITIZED_TMP}" SEED_MOMENTUM=${energy} \\
+      k4run ${repo_root}/simulation/jobs/job4_tracking.py \\
+      &>> ${log_path}/${label}.log
+if [[ ! -s "\${LOCAL_DIGITIZED_TMP}" ]]; then
+    echo "ERROR: tracking produced no output (raw sim is safe on EOS)."
+    exit 5
+fi
+mv "\${LOCAL_DIGITIZED_TMP}" "\${LOCAL_DIGITIZED}"
+
+# ---------- 5. ecal TTree conversion ----------
+if [[ ! -s "\${LOCAL_TREE}" ]]; then
+    echo "ERROR: ecal-tree conversion produced no output (raw sim is safe on EOS)."
+    exit 3
+fi
+
+# ---------- 6. Stage out the ecal chunk tree and the digitized+tracks file ----------
+LOCAL_TREE_SIZE=\$(stat -c%s "\${LOCAL_TREE}")
+xrdcp --force "\${LOCAL_TREE}" "root://eosexperiment.cern.ch/${remote_tree}"
+if [[ \$? -ne 0 ]]; then
+    echo "ERROR: xrdcp stage-out of the ecal tree failed."
+    exit 4
+fi
+REMOTE_TREE_SIZE=\$(xrdfs eosexperiment.cern.ch stat "${remote_tree}" 2>/dev/null | awk '/Size:/{print \$2}')
+if [[ "\${REMOTE_TREE_SIZE}" != "\${LOCAL_TREE_SIZE}" ]]; then
+    echo "ERROR: ecal-tree stage-out verification failed (local=\${LOCAL_TREE_SIZE}, remote='\${REMOTE_TREE_SIZE}')."
+    exit 4
+fi
+
+LOCAL_DIGITIZED_SIZE=\$(stat -c%s "\${LOCAL_DIGITIZED}")
+xrdcp --force "\${LOCAL_DIGITIZED}" "root://eosexperiment.cern.ch/${remote_digitized}"
+if [[ \$? -ne 0 ]]; then
+    echo "ERROR: xrdcp stage-out of digitized+tracks failed."
+    exit 4
+fi
+REMOTE_DIGITIZED_SIZE=\$(xrdfs eosexperiment.cern.ch stat "${remote_digitized}" 2>/dev/null | awk '/Size:/{print \$2}')
+if [[ "\${REMOTE_DIGITIZED_SIZE}" != "\${LOCAL_DIGITIZED_SIZE}" ]]; then
+    echo "ERROR: digitized+tracks stage-out verification failed (local=\${LOCAL_DIGITIZED_SIZE}, remote='\${REMOTE_DIGITIZED_SIZE}')."
+    exit 4
+fi
+
+echo "Job finished. sim=${remote_sim}  tree=${remote_tree} (\${REMOTE_TREE_SIZE} bytes)  digitized+tracks=${remote_digitized} (\${REMOTE_DIGITIZED_SIZE} bytes)"
+EOF
+
+chmod +x ${steer_path}/${condorsh}
+
+# --------------------------------------------------
+# CONDOR SUBMIT FILE
+# --------------------------------------------------
+cat > ${steer_path}/${condorsub} <<EOF
+executable              = ${steer_path}/${condorsh}
+log                     = ${log_path}/${condorfile}.log
+output                  = ${log_path}/outfile_${condorfile}.txt
+error                   = ${log_path}/errors_${condorfile}.txt
+should_transfer_files   = Yes
+when_to_transfer_output = ON_EXIT
+# Everything big is staged out to EOS by xrdcp inside the job; do NOT let
+# Condor ALSO transfer it back into the AFS steer/ dir (that duplicate is what
+# filled the AFS home volume). Empty = transfer no output files back.
+transfer_output_files   = ""
+request_cpus            = 1
+# 8 GB, not 3: a 2000-event electron chunk at 99 GeV peaks near 6 GB in the
+# ecal tree (EcalTreeWriter, in the digitisation job),
+# and jobs that exceed the cgroup limit go on hold mid-campaign.
+request_memory          = 8 GB
+request_disk            = 12 GB
++JobFlavour             = "tomorrow"
+queue 1
+EOF
+
+# --------------------------------------------------
+# SUBMIT
+# --------------------------------------------------
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "  DRY_RUN=1 — not submitting ${condorsub}"
+else
+    cd ${steer_path}
+    condor_submit ${condorsub}
+    cd - > /dev/null
+fi

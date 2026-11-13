@@ -1,0 +1,1418 @@
+/*
+ * PedestalMipCalibrator: pedestal + MIP calibration as a Gaudi component,
+ * generating the same calibration tables already consumed by
+ * data_conversion/python/siwecal_eventbuilder/calibration.py::from_files (3-column-per-SCA
+ * pedestal format; "layer chip channel mpv empv widthmpv chi2ndf nentries"
+ * MIP format), replacing the external reference tool SiWECAL-TB-analysis.
+ *
+ * Ported method: SiWECAL-TB-analysis/SLBperformance/DecodedSLBAnalysis.cc::
+ * NSlabsAnalysis (event selection + histogram filling: badbcid==0,
+ * nhits<=MaxNhit, SimpleCoincidenceTagger, 400 bins 100.5-500.5 pedestal /
+ * 900 bins 100.5-1000.5 MIP histograms per (slab,chip,channel,sca)) and
+ * SLBperformance/TBchecks/analysis.h::pedanalysis / mipanalysis_summary
+ * (pedestal_mode=1) for the fits -- verified to be the method that actually
+ * produced this repo's deployed the MuonCalib tree/{pedestals,mips}
+ * files (their header lines match verbatim). Do not confuse with the
+ * simpler single-Gaussian pedestal fit or the noise-covariance
+ * decomposition described in earlier, less precise exploration notes --
+ * those are a different reference-tool code path not used to produce this
+ * repo's actual calibration data.
+ *
+ * Mip mode needs its own per-SCA pedestal histograms too: the reference's
+ * "pedestal_mode=1" on-the-fly subtraction uses a raw truncated mean of the
+ * SAME per-SCA pedestal histogram filled in the same pass, NOT the fitted
+ * Pedestal output file -- so Mip mode is self-contained and does not read
+ * an external pedestal file.
+ *
+ * Plain Gaudi::Algorithm (not a k4FWCore Producer/Transformer): this is a
+ * global reduction over an entire run (histograms/fits only final after
+ * every entry is seen), and its output is ASCII calibration tables, not a
+ * per-event EDM4hep collection. All work happens in initialize(), same
+ * self-contained-I/O pattern as EcalToEDM4hep/EcalRawDecoder.
+ */
+#include "siwecal/CalibrationTables.h"
+#include "siwecal/PadMapGeometry.h"
+#include "siwecal/PedestalMipCalib.h"
+#include "siwecal/SlbFrameDecoder.h"  // kSlbDepth, kSkirocsPerAsu, kScasInSkiroc, kChannelsInSkiroc
+#include "siwecal/TriggerTurnOn.h"
+
+#include "Gaudi/Algorithm.h"
+#include "Gaudi/Property.h"
+
+#include "TFile.h"
+#include "TH1D.h"
+#include "TH1F.h"
+#include "TH2F.h"
+#include "TString.h"
+#include "TTree.h"
+
+#include <cmath>
+#include <sstream>
+#include <utility>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <vector>
+
+using k4siwecal::kChannelsInSkiroc;
+using k4siwecal::kScasInSkiroc;
+using k4siwecal::kSkirocsPerAsu;
+using k4siwecal::kSlbDepth;
+
+namespace {
+inline std::size_t histIndex(int slab, int chip, int chn, int sca) {
+  return ((static_cast<std::size_t>(slab) * kSkirocsPerAsu + chip) * kChannelsInSkiroc + chn) * kScasInSkiroc + sca;
+}
+constexpr std::size_t kNumHist =
+    static_cast<std::size_t>(kSlbDepth) * kSkirocsPerAsu * kChannelsInSkiroc * kScasInSkiroc;
+
+// Shared binning for the pedestal-like ("ped"/"ped_high"/"ped_low") and
+// MIP-like ("mip"/"mip_high"/"mip_low") histogram grids. Used both when
+// building them from a siwecaldecoded tree (Mode=Pedestal|Mip|Fill) and
+// when reconstructing an empty placeholder for a zero-suppressed (missing)
+// key while reading a merged histogram file (Mode=FitPedestal|FitMip) --
+// binning must always match exactly or a hadd merge of same-named
+// histograms across Fill jobs would silently corrupt/misalign bins.
+constexpr int kPedNBins = 400;
+constexpr double kPedLo = 100.5;
+constexpr double kPedHi = 500.5;
+constexpr int kMipNBins = 900;
+constexpr double kMipLo = 100.5;
+constexpr double kMipHi = 1000.5;
+}  // namespace
+
+struct PedestalMipCalibrator final : Gaudi::Algorithm {
+  using Gaudi::Algorithm::Algorithm;
+
+  StatusCode initialize() override {
+    TH1::AddDirectory(kFALSE);  // histograms below are owned by us, not by whatever TFile is "current"
+
+    const bool highGain = (m_gain.value() == "high");
+    if (m_mode.value() == "Fill") {
+      if (m_inputFiles.value().empty()) {
+        return error() << "No InputFiles provided" << endmsg, StatusCode::FAILURE;
+      }
+      if (m_outputHistogramFile.value().empty()) {
+        return error() << "Fill mode requires OutputHistogramFile" << endmsg, StatusCode::FAILURE;
+      }
+      return runFill();
+    }
+    if (m_mode.value() == "FitPedestal") {
+      if (m_inputHistogramFile.value().empty()) {
+        return error() << "FitPedestal mode requires InputHistogramFile" << endmsg, StatusCode::FAILURE;
+      }
+      return fitPedestalFromHistograms(highGain);
+    }
+    if (m_mode.value() == "FitTrigger") {
+      if (m_inputHistogramFile.value().empty() || m_inputPedestalFile.value().empty() ||
+          m_inputMipFile.value().empty()) {
+        return error() << "FitTrigger mode requires InputHistogramFile, InputPedestalFile and InputMipFile"
+                       << endmsg,
+               StatusCode::FAILURE;
+      }
+      if (m_outputTriggerChipFile.value().empty() || m_outputTriggerChannelFile.value().empty()) {
+        return error() << "FitTrigger mode requires OutputTriggerChipFile and OutputTriggerChannelFile" << endmsg,
+               StatusCode::FAILURE;
+      }
+      return fitTriggerFromHistograms();
+    }
+    if (m_mode.value() == "FitMip") {
+      if (m_inputHistogramFile.value().empty()) {
+        return error() << "FitMip mode requires InputHistogramFile" << endmsg, StatusCode::FAILURE;
+      }
+      return fitMipFromHistograms(highGain);
+    }
+
+    if (m_inputFiles.value().empty()) {
+      return error() << "No InputFiles provided" << endmsg, StatusCode::FAILURE;
+    }
+    if (m_mode.value() == "Pedestal") {
+      return runPedestal(highGain);
+    }
+    if (m_mode.value() == "Mip") {
+      return runMip(highGain);
+    }
+    return error() << "Unknown Mode '" << m_mode.value() << "' (expected Pedestal|Mip|Fill|FitPedestal|FitMip|FitTrigger)"
+                    << endmsg,
+           StatusCode::FAILURE;
+  }
+
+  StatusCode execute(const EventContext&) const override { return StatusCode::SUCCESS; }
+
+  Gaudi::Property<std::vector<std::string>> m_inputFiles{
+      this, "InputFiles", {}, "One or more siwecaldecoded ROOT files (multiple = accumulated statistics)"};
+  Gaudi::Property<std::string> m_treeName{this, "TreeName", "siwecaldecoded", "Input TTree name"};
+  Gaudi::Property<std::string> m_mode{this, "Mode", "Pedestal", "Pedestal|Mip"};
+  Gaudi::Property<std::string> m_gain{this, "Gain", "high", "high|low"};
+  Gaudi::Property<std::string> m_outputPedestalFile{this, "OutputPedestalFile", "", "Pedestal mode output path"};
+  Gaudi::Property<std::string> m_outputMipFile{this, "OutputMipFile", "", "Mip mode output path"};
+  Gaudi::Property<int> m_maxNhit{this, "MaxNhit", 1, "nhits<=this to accept the SCA slice"};
+  Gaudi::Property<int> m_nSlabsHit{this, "NSlabsHit", 8,
+                                   "Coincidence tagger requirement: total slabs (incl. this one) expected hit"};
+  // --------------------------------------------------- beam-spill splitting ---
+  // The acquisitions of a run separate cleanly into beam-on and beam-off by
+  // their total occupancy: measured on run_000060 (th220) the per-acquisition
+  // hit count is bimodal, ~4 hits (median) when quiet against a 500-2000 hit
+  // bump, with a near-empty valley between ~50 and ~500, and the high-occupancy
+  // acquisitions come in contiguous blocks of ~40 separated by long quiet
+  // stretches -- i.e. the SPS spill structure, not a rate fluctuation. Anything
+  // in that valley therefore gives the same split; 200 sits in the middle of it.
+  //
+  // NOTE on using this with the DEFAULT NSlabsHit=8: don't. The coincidence
+  // tagger is itself a beam trigger (it wants >=8 slabs lit at the same BCID),
+  // so 99.1% of accepted SCA slices already come from in-spill acquisitions and
+  // the "out" sample is empty for all practical purposes. A meaningful in/out
+  // comparison needs the coincidence relaxed (NSlabsHit=1) so that BOTH samples
+  // are selected identically and only the beam differs.
+  Gaudi::Property<std::string> m_spillSelect{
+      this, "SpillSelect", "all",
+      "all|in|out: keep every acquisition (all, the historical behaviour), only those above "
+      "SpillOccupancyCut (in = beam on), or only those at or below it (out = beam off)"};
+  Gaudi::Property<int> m_spillOccupancyCut{
+      this, "SpillOccupancyCut", 200,
+      "Total accepted-hit occupancy separating in-spill from out-of-spill acquisitions"};
+  Gaudi::Property<double> m_minMipIntegral{this, "MinMipIntegral", 200.,
+                                           "Combined per-channel MIP histogram integral required to ATTEMPT a fit. "
+                                           "A channel below this (but with >0 entries) is not masked -- it is handed "
+                                           "to the chip/slab fallback pass. A channel is only left masked when it "
+                                           "had exactly 0 entries."};
+  Gaudi::Property<double> m_chipFallbackMinIntegral{
+      this, "ChipFallbackMinIntegral", 2000.,
+      "For a channel with too few entries of its own: combined-chip (all 64 channels' MIP histograms summed, "
+      "port of the reference tool's hmip_chip cross-check) integral required to fit a chip-level fallback MPV. "
+      "Matches SiWECAL-TB-analysis/SLBperformance/TBchecks/analysis.h's own hmip_chip threshold"};
+  Gaudi::Property<double> m_pedestalMaxMeanAdc{
+      this, "PedestalMaxMeanAdc", 300.0,
+      "Pedestal-fit outlier ceiling: a fitted SCA mean that is NaN/Inf or exceeds this is treated as unusable "
+      "and filled from the channel's other usable SCAs (matches data_conversion/calibration/clean_pedestals.py's MAX_MEAN)"};
+  Gaudi::Property<double> m_mipFallbackMaxAdc{
+      this, "MipFallbackMaxAdc", 300.0,
+      "When the Langau fit fails (ndf<=0), fall back to the combined histogram's peak bin as the MPV if it is "
+      "positive and at or below this ceiling; otherwise the channel is masked as before. Tune down for low "
+      "gain (e.g. ~30) where a real MIP peak sits at a much smaller ADC value"};
+  // ------------------------------------------------------------ fit quality ---
+  // There is deliberately NO chi2/ndf gate. chi2/ndf answers "is the model
+  // exactly right, given only Poisson noise", and the Langau is an approximation
+  // of the real MIP response -- so at high statistics the answer is always "no",
+  // however good the MPV. Measured on run_000060's slab 14, growing the same
+  // spectrum by aggregating channels:
+  //
+  //     N entries    chi2/ndf    fitted MPV    |MPV-peak|/MPV (rebin 4)
+  //           639        1.16         27.00                      0.093
+  //         1,448        1.49         26.27                      0.123
+  //         9,565        3.78         26.13                      0.024
+  //        55,225       12.25         25.41                      0.004
+  //        74,555       17.20         25.58                      0.003
+  //
+  // chi2/ndf climbs 1.2 -> 17 while the MPV sits still at 25-27. The old ceilings
+  // (1.1 per channel, 25 for chip/slab) therefore rejected every fit above ~600
+  // entries and EVERY chip/slab fit -- which is why the slab fallback fired
+  // exactly zero times across all of th220, and one channel with 11,570 entries
+  // and neighbours fitting at chi2/ndf 0.87 fell all the way to the global
+  // average. The gates below are scale-free instead: they mean the same thing for
+  // a 600-entry channel and a 12M-entry slab.
+  Gaudi::Property<double> m_mipHistMaxTol{
+      this, "MipHistMaxTol", 0.20,
+      "Peak-consistency gate, the PRIMARY fit-quality test: the fitted MPV must land within this fraction of "
+      "the peak the spectrum actually shows (|peak - mpv| <= tol*mpv), or the fit is not believed. Scale-free "
+      "-- across 639..74,555 entries a good fit never exceeded 0.123 (see table above), so 0.20 accepts every "
+      "good fit measured with room to spare. Failing it, the channel falls back to the histogram peak itself "
+      "(status 2, empv=-2)."};
+  Gaudi::Property<int> m_mipPeakRebin{
+      this, "MipPeakRebin", 4,
+      "ADC per bin used to locate the spectrum's peak (the histograms are 1 ADC/bin). The raw maximum bin is a "
+      "fluctuation when statistics are thin -- rebinning makes the peak a property of the distribution rather "
+      "than of the luckiest bin. Measured: at ~640 entries the peak deviation of a good fit drops from 0.148 "
+      "(1 ADC/bin) to 0.093 (4 ADC/bin)."};
+  Gaudi::Property<double> m_maxMipRelErr{
+      this, "MaxMipRelErr", 0.10,
+      "Relative-error gate, which dominates at LOW statistics: the MPV is what every hit's ADC is divided by, "
+      "so a 10% error on it is a 10% error on that channel's energy scale. Measured: empv/mpv is 0.45 at 49 "
+      "entries, 0.053 at 167, 0.003 at 9,565 -- so this rejects exactly the spectra where the MPV is not "
+      "determined, and is silent everywhere else."};
+  Gaudi::Property<double> m_mipLowLim{
+      this, "MipLowLim", 10.0,
+      "'Looks like a real MIP' range check, high gain (pllohigh in the reference tool, originally a single "
+      "lower bound of 45 -- widened to a [MipLowLim, MipHighLim] window after inspecting this run's actual "
+      "peak histograms, where genuine MIP peaks sit around 20-45 ADC, well below the original 45 floor; the "
+      "lower bound was further lowered to 10 to accept the low-side borderline channels that were being "
+      "sent to fallback despite a converged fit)"};
+  Gaudi::Property<double> m_mipHighLim{
+      this, "MipHighLim", 50.0,
+      "Upper bound of the 'looks like a real MIP' range check, high gain -- see MipLowLim"};
+  Gaudi::Property<std::vector<std::string>> m_mipWindowSlabOverrides{
+      this, "MipWindowSlabOverrides", {},
+      "Per-slab 'looks like a real MIP' windows, high gain, as 'slab:low:high' entries; a slab not listed "
+      "keeps [MipLowLim, MipHighLim] (or MipWindowThresholdSlabHigh, see SlabZFile)"};
+  Gaudi::Property<std::string> m_slabZFile{
+      this, "SlabZFile", "",
+      "common/mappings/slab_z_positions.yml; when set, every slab its technology block marks with a threshold_dac "
+      "of its own (slab 12, the chip-on-board, at DAC 243) gets MipWindowThresholdSlabHigh as the upper bound "
+      "of its MIP window, because a higher discriminator truncates the spectrum and pushes the fitted MPV up"};
+  Gaudi::Property<double> m_mipWindowThresholdSlabHigh{
+      this, "MipWindowThresholdSlabHigh", 90.0,
+      "Upper MIP-window bound [ADC] for the slabs with a threshold_dac of their own (see SlabZFile)"};
+  Gaudi::Property<double> m_mipLowLimLowGain{
+      this, "MipLowLimLowGain", 2.0,
+      "'Looks like a real MIP' lower bound, low gain (pllolow in the reference tool was 5.; scaled down "
+      "proportionally to MipLowLim/45 pending real low-gain data to check against)"};
+  Gaudi::Property<double> m_mipHighLimLowGain{
+      this, "MipHighLimLowGain", 20.0,
+      "Upper bound of the 'looks like a real MIP' range check, low gain -- see MipLowLimLowGain"};
+  Gaudi::Property<std::string> m_diagnosticsFile{
+      this, "DiagnosticsFile", "",
+      "Optional ROOT file with cross-check summary plots (2D layer/chip vs. sca/channel maps of the written "
+      "value and a per-cell status code, plus 1D value distributions); empty (default) = no plots written"};
+  Gaudi::Property<std::string> m_outputHistogramFile{
+      this, "OutputHistogramFile", "",
+      "Mode=Fill: output ROOT file with the ped_high/ped_low/mip_high/mip_low histogram grids (zero-suppressed: "
+      "only non-empty histograms are written), no fit"};
+  Gaudi::Property<std::string> m_inputHistogramFile{
+      this, "InputHistogramFile", "",
+      "Mode=FitPedestal|FitMip|FitTrigger: input ROOT file with a (possibly hadd-merged) histogram grid written by "
+      "Mode=Fill, read instead of building histograms from InputFiles trees"};
+
+  // Mode=FitTrigger: the trigger turn-on per channel, chip and slab from the Fill grids (see TriggerTurnOn.h).
+  Gaudi::Property<std::string> m_inputPedestalFile{
+      this, "InputPedestalFile", "",
+      "Mode=FitTrigger: high-gain pedestal table of the same threshold set (per-SCA pedestal subtraction)"};
+  Gaudi::Property<std::string> m_inputMipFile{
+      this, "InputMipFile", "",
+      "Mode=FitTrigger: high-gain MIP table of the same set; its masked channels (mpv <= 0, or masked in the "
+      "pedestal table) stay out of every sum and get their chip's turn-on"};
+  Gaudi::Property<std::string> m_outputTriggerChipFile{
+      this, "OutputTriggerChipFile", "",
+      "Mode=FitTrigger: '#layer chip mu_adc sigma_adc plateau npass ntotal status' (status 0 = own fit, "
+      "1 = slab's values, 2 = all-slab values)"};
+  Gaudi::Property<std::string> m_outputTriggerChannelFile{
+      this, "OutputTriggerChannelFile", "",
+      "Mode=FitTrigger: '#layer chip channel mu_adc sigma_adc plateau npass ntotal status' (status 0 = own mu "
+      "with the chip's sigma and plateau, 1 = chip's values, 3 = masked: chip's values)"};
+  Gaudi::Property<std::string> m_outputTriggerSlabFile{
+      this, "OutputTriggerSlabFile", "",
+      "Mode=FitTrigger (optional): '#layer mu_adc sigma_adc plateau npass ntotal status' (status 0 = own fit, "
+      "2 = all-slab values)"};
+  Gaudi::Property<double> m_triggerMinPassChip{
+      this, "TriggerMinPassChip", 300.,
+      "Mode=FitTrigger: hit-bit readouts a chip (or slab) needs in the fit range for a fit of its own"};
+  Gaudi::Property<double> m_triggerMinPassChannel{
+      this, "TriggerMinPassChannel", 30.,
+      "Mode=FitTrigger: hit-bit readouts a channel needs in the fit range for a threshold of its own"};
+  Gaudi::Property<double> m_triggerMinTurnOnChannel{
+      this, "TriggerMinTurnOnChannel", 30.,
+      "Mode=FitTrigger: readouts a channel needs inside its chip's turn-on (mu +- 2 sigma), where mu is "
+      "actually measured, for a threshold of its own"};
+
+ private:
+  // Bound branch buffers for one siwecaldecoded tree, matching the layout
+  // written by EcalRawDecoder / SiWECAL-TB-analysis's SLBraw2ROOT.cc.
+  struct TreeBuffers {
+    int nSlboards = 0;
+    int bcid[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc];
+    int badbcid[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc];
+    int nhits[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc];
+    int hitbitLow[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc][kChannelsInSkiroc];
+    int hitbitHigh[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc][kChannelsInSkiroc];
+    int adcLow[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc][kChannelsInSkiroc];
+    int adcHigh[kSlbDepth][kSkirocsPerAsu][kScasInSkiroc][kChannelsInSkiroc];
+  };
+
+  static void bindReadBranches(TTree& tree, TreeBuffers& buf) {
+    tree.SetBranchAddress("n_slboards", &buf.nSlboards);
+    tree.SetBranchAddress("bcid", buf.bcid);
+    tree.SetBranchAddress("badbcid", buf.badbcid);
+    tree.SetBranchAddress("nhits", buf.nhits);
+    tree.SetBranchAddress("hitbit_low", buf.hitbitLow);
+    tree.SetBranchAddress("hitbit_high", buf.hitbitHigh);
+    tree.SetBranchAddress("adc_low", buf.adcLow);
+    tree.SetBranchAddress("adc_high", buf.adcHigh);
+  }
+
+  // Total accepted-hit occupancy of one acquisition: sum of nhits over every
+  // (slab,chip,sca) slot that survives the badbcid/bcid preselection. This is
+  // the quantity SpillSelect cuts on -- see the property's doc for why it
+  // separates beam-on from beam-off acquisitions.
+  static long acquisitionOccupancy(const TreeBuffers& buf) {
+    long occ = 0;
+    for (int slab = 0; slab < buf.nSlboards; ++slab) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+          if (buf.badbcid[slab][chip][sca] != 0 || buf.bcid[slab][chip][sca] < 0) continue;
+          occ += buf.nhits[slab][chip][sca];
+        }
+      }
+    }
+    return occ;
+  }
+
+  // Shared NSlabsAnalysis-style event loop over all InputFiles: for every
+  // (slab,chip,sca) passing the badbcid/nhits/coincidence selection, calls
+  // fn(buf, slab, chip, sca) with the TreeBuffers entry already loaded (both
+  // gains' hitbit/adc arrays available) -- the caller decides what to do
+  // per channel/gain. This is the same selection logic
+  // forEachSelectedChannel used to run inline; factored out so Mode=Fill
+  // can build all 4 histogram grids (both gains) in one tree pass instead
+  // of one forEachSelectedChannel call per gain.
+  template <typename Fn>
+  StatusCode forEachSelectedSca(const Fn& fn) const {
+    const std::string& spill = m_spillSelect.value();
+    if (spill != "all" && spill != "in" && spill != "out") {
+      return error() << "SpillSelect must be all|in|out, got '" << spill << "'" << endmsg, StatusCode::FAILURE;
+    }
+    const bool spillFilter = (spill != "all");
+    const bool wantInSpill = (spill == "in");
+    for (const auto& path : m_inputFiles.value()) {
+      std::unique_ptr<TFile> file(TFile::Open(path.c_str(), "READ"));
+      if (!file || file->IsZombie()) {
+        return error() << "Cannot open input file: " << path << endmsg, StatusCode::FAILURE;
+      }
+      auto* tree = dynamic_cast<TTree*>(file->Get(m_treeName.value().c_str()));
+      if (!tree) {
+        return error() << "Tree '" << m_treeName.value() << "' not found in " << path << endmsg,
+               StatusCode::FAILURE;
+      }
+      // TreeBuffers is ~3.7MB (fixed [15][16][15][64] int arrays) -- too
+      // large for a stack frame on the smaller worker-thread stacks
+      // Gaudi/k4run can use. Heap-allocate it explicitly.
+      auto buf = std::make_unique<TreeBuffers>();
+      bindReadBranches(*tree, *buf);
+      const Long64_t nEntries = tree->GetEntries();
+      for (Long64_t entry = 0; entry < nEntries; ++entry) {
+        tree->GetEntry(entry);
+        if (spillFilter) {
+          const bool inSpill = acquisitionOccupancy(*buf) > m_spillOccupancyCut.value();
+          if (inSpill != wantInSpill) continue;
+        }
+        for (int slab = 0; slab < buf->nSlboards; ++slab) {
+          for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+            for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+              if (buf->badbcid[slab][chip][sca] != 0 || buf->bcid[slab][chip][sca] < 0) continue;
+              if (buf->nhits[slab][chip][sca] > m_maxNhit.value()) continue;
+
+              const int bcidSeen = k4siwecal::simpleCoincidenceTagger(buf->bcid, buf->badbcid, buf->nSlboards, slab,
+                                                                       buf->bcid[slab][chip][sca]);
+              if (bcidSeen < (m_nSlabsHit.value() - 1)) continue;
+
+              fn(*buf, slab, chip, sca);
+            }
+          }
+        }
+      }
+    }
+    return StatusCode::SUCCESS;
+  }
+
+  // Thin wrapper over forEachSelectedSca: same selection, but iterates the
+  // 64 channels of one requested gain and hands the caller (slab, chip,
+  // chn, sca, hitbit, adcValue) directly, matching the original
+  // (pre-refactor) callback shape used by runPedestal/runMip. Behavior is
+  // byte-for-byte identical to before this was split out.
+  template <typename Fn>
+  StatusCode forEachSelectedChannel(bool highGain, const Fn& fn) const {
+    return forEachSelectedSca([&](TreeBuffers& buf, int slab, int chip, int sca) {
+      for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+        const int hitbit = highGain ? buf.hitbitHigh[slab][chip][sca][chn] : buf.hitbitLow[slab][chip][sca][chn];
+        const int adcValue = highGain ? buf.adcHigh[slab][chip][sca][chn] : buf.adcLow[slab][chip][sca][chn];
+        fn(slab, chip, chn, sca, hitbit, adcValue);
+      }
+    });
+  }
+
+  static std::vector<std::unique_ptr<TH1F>> makeHistograms(const char* prefix, int nbins, double lo, double hi) {
+    std::vector<std::unique_ptr<TH1F>> hist(kNumHist);
+    for (int slab = 0; slab < kSlbDepth; ++slab) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            hist[histIndex(slab, chip, chn, sca)] =
+                std::make_unique<TH1F>(Form("%s_s%d_c%d_ch%d_sca%d", prefix, slab, chip, chn, sca), "", nbins, lo, hi);
+          }
+        }
+      }
+    }
+    return hist;
+  }
+
+  StatusCode runPedestal(bool highGain) {
+    auto hist = makeHistograms("ped", kPedNBins, kPedLo, kPedHi);
+
+    const auto sc = forEachSelectedChannel(highGain, [&](int slab, int chip, int chn, int sca, int hitbit, int adc) {
+      if (hitbit == 0) {
+        hist[histIndex(slab, chip, chn, sca)]->Fill(adc);
+      }
+    });
+    if (!sc.isSuccess()) return sc;
+
+    return writePedestalTable(hist);
+  }
+
+  // Fits + writes the pedestal table from an already-populated histogram
+  // grid, regardless of whether it was just built from InputFiles trees
+  // (runPedestal) or read back from a hadd-merged Mode=Fill output
+  // (fitPedestalFromHistograms) -- identical code path either way, so the
+  // fit/robustness/diagnostics logic can never drift between the two.
+  StatusCode writePedestalTable(std::vector<std::unique_ptr<TH1F>>& hist) {
+    std::ofstream fout(m_outputPedestalFile.value());
+    if (!fout) {
+      return error() << "Cannot open output file: " << m_outputPedestalFile.value() << endmsg, StatusCode::FAILURE;
+    }
+    fout << "#pedestal results (fit to a gaussian) remove channels/sca with two pedestals peaks from the analysis "
+            ": PROTO15\n";
+    fout << "#layer chip channel";
+    for (int isca = 0; isca < kScasInSkiroc; ++isca) {
+      fout << " ped_mean" << isca << " ped_error" << isca << " ped_width" << isca;
+    }
+    fout << "\n";
+
+    // Optional cross-check plots (see DiagnosticsFile doc): 2D maps indexed
+    // exactly like the reference tool's ped_all/width_all
+    // (layer*20+chip, sca*100+channel), plus a per-cell status code map
+    // (0=masked, 1=genuine fit, 2=filled from the channel's other usable
+    // SCAs) so the new robustness policy's decisions are directly visible,
+    // and 1D distributions of the written mean/width for a quick sanity
+    // check of the whole run.
+    std::unique_ptr<TFile> diagFile;
+    TH2F* hMeanMap = nullptr;
+    TH2F* hWidthMap = nullptr;
+    TH2F* hStatusMap = nullptr;
+    TH1F* hMeanDist = nullptr;
+    TH1F* hWidthDist = nullptr;
+    if (!m_diagnosticsFile.value().empty()) {
+      diagFile.reset(TFile::Open(m_diagnosticsFile.value().c_str(), "RECREATE"));
+      if (!diagFile || diagFile->IsZombie()) {
+        return error() << "Cannot create diagnostics file: " << m_diagnosticsFile.value() << endmsg,
+               StatusCode::FAILURE;
+      }
+      diagFile->cd();
+      hMeanMap = new TH2F("pedestal_mean_map", "Pedestal mean; layer*20+chip; sca*100+channel", 300, -0.5, 299.5,
+                           1500, -0.5, 1499.5);
+      hWidthMap = new TH2F("pedestal_width_map", "Pedestal width; layer*20+chip; sca*100+channel", 300, -0.5, 299.5,
+                            1500, -0.5, 1499.5);
+      hStatusMap = new TH2F("pedestal_status_map",
+                             "Pedestal SCA status (0=masked, 1=fit, 2=filled-from-average); "
+                             "layer*20+chip; sca*100+channel",
+                             300, -0.5, 299.5, 1500, -0.5, 1499.5);
+      hMeanDist = new TH1F("pedestal_mean_dist", "Pedestal mean distribution (unmasked SCAs); ADC", 200, 0.0, 400.0);
+      hWidthDist = new TH1F("pedestal_width_dist", "Pedestal width distribution (unmasked SCAs); ADC", 100, 0.0, 20.0);
+    }
+
+    // Robustness policy, ported from data_conversion/calibration/clean_pedestals.py's
+    // "previous correction" (already validated on real data) directly into
+    // the generation step, rather than as a separate post-processing pass:
+    //   - A fitted SCA is "usable" only if the fit converged (kGood) AND its
+    //     mean is finite, strictly positive, and at or below
+    //     PedestalMaxMeanAdc. NaN/Inf and out-of-range means (e.g. a stray
+    //     high-charge tail biasing the Gaussian fit) are NOT usable.
+    //   - If a channel has at least one usable SCA: usable SCAs keep their
+    //     own fitted (mean, error, width); every unusable SCA is filled with
+    //     the plain average of the usable SCAs' mean/width, flagged with the
+    //     existing error=-10 sentinel (calibration.py::_read_pedestal_file
+    //     only inspects the mean to decide masking, so this sentinel is for
+    //     human/debugging visibility, not the masking decision itself).
+    //   - If a channel has NO usable SCA at all: the whole channel is
+    //     written as 15x "0 -10 0" -- an all-zero-means row is exactly the
+    //     masking convention calibration.py::_read_pedestal_file already
+    //     checks for ("canal a 0 cuenta como masked").
+    const double maxMean = m_pedestalMaxMeanAdc.value();
+    for (int layer = 0; layer < kSlbDepth; ++layer) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          double mean[kScasInSkiroc] = {0};
+          double error[kScasInSkiroc] = {0};
+          double width[kScasInSkiroc] = {0};
+          bool usable[kScasInSkiroc] = {false};
+
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            auto& h = *hist[histIndex(layer, chip, chn, sca)];
+            const auto r = k4siwecal::fitPedestalSca(h);
+            if (r.status == k4siwecal::PedestalFitResult::Status::kGood && std::isfinite(r.mean) && r.mean > 0.0 &&
+                r.mean <= maxMean) {
+              mean[sca] = r.mean;
+              // Minos error estimation can fail (non-finite r.error) even when
+              // the mean itself fitted fine; the mean/width are still usable,
+              // so keep them and just zero out the unusable error rather than
+              // writing a NaN that would propagate as text into the table.
+              error[sca] = std::isfinite(r.error) ? r.error : 0.0;
+              width[sca] = r.width;
+              usable[sca] = true;
+            }
+          }
+
+          int nUsable = 0;
+          double sumMean = 0.0;
+          double sumWidth = 0.0;
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            if (usable[sca]) {
+              ++nUsable;
+              sumMean += mean[sca];
+              sumWidth += width[sca];
+            }
+          }
+
+          const double diagX = layer * 20 + chip;
+          fout << layer << " " << chip << " " << chn << " ";
+          if (nUsable == 0) {
+            for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+              fout << "0 -10 0 ";
+              if (hMeanMap != nullptr) {
+                const double diagY = sca * 100 + chn;
+                hMeanMap->Fill(diagX, diagY, 0.0);
+                hWidthMap->Fill(diagX, diagY, 0.0);
+                hStatusMap->Fill(diagX, diagY, 0.0);
+              }
+            }
+          } else {
+            const double avgMean = sumMean / nUsable;
+            const double avgWidth = sumWidth / nUsable;
+            for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+              const double m = usable[sca] ? mean[sca] : avgMean;
+              const double w = usable[sca] ? width[sca] : avgWidth;
+              fout << m << " " << (usable[sca] ? error[sca] : -10.0) << " " << w << " ";
+              if (hMeanMap != nullptr) {
+                const double diagY = sca * 100 + chn;
+                hMeanMap->Fill(diagX, diagY, m);
+                hWidthMap->Fill(diagX, diagY, w);
+                hStatusMap->Fill(diagX, diagY, usable[sca] ? 1.0 : 2.0);
+                hMeanDist->Fill(m);
+                hWidthDist->Fill(w);
+              }
+            }
+          }
+          fout << "\n";
+        }
+      }
+    }
+    if (diagFile) {
+      diagFile->cd();
+      // TH1::AddDirectory(kFALSE) at the top of initialize() (needed so the
+      // per-SCA fit histograms above aren't auto-attached to whatever TFile
+      // is "current") also applies to these diagnostic histograms, so cd()
+      // doesn't auto-register them -- Write() each one explicitly.
+      hMeanMap->Write();
+      hWidthMap->Write();
+      hStatusMap->Write();
+      hMeanDist->Write();
+      hWidthDist->Write();
+      diagFile->Close();
+      info() << "PedestalMipCalibrator: wrote pedestal diagnostics to " << m_diagnosticsFile.value() << endmsg;
+    }
+    info() << "PedestalMipCalibrator: wrote pedestal table to " << m_outputPedestalFile.value() << endmsg;
+    return StatusCode::SUCCESS;
+  }
+
+  StatusCode runMip(bool highGain) {
+    auto pedHist = makeHistograms("mipped", kPedNBins, kPedLo, kPedHi);
+    auto mipHist = makeHistograms("mip", kMipNBins, kMipLo, kMipHi);
+
+    const auto sc = forEachSelectedChannel(highGain, [&](int slab, int chip, int chn, int sca, int hitbit, int adc) {
+      const auto idx = histIndex(slab, chip, chn, sca);
+      if (hitbit == 0) {
+        pedHist[idx]->Fill(adc);
+      } else if (hitbit == 1) {
+        mipHist[idx]->Fill(adc);
+      }
+    });
+    if (!sc.isSuccess()) return sc;
+
+    return writeMipTable(pedHist, mipHist, highGain);
+  }
+
+  // One (layer,chip,channel) MIP result, before the chip/slab fallback
+  // pass below is applied. status: 0=masked/lowstats/bad-fit (mpv==0, needs
+  // fallback), 1=genuine fit, 2=histogram-peak fallback. (status 3 -- "fit
+  // succeeded but the MPV is outside the plausible MIP range" -- is no longer
+  // produced: such a fit is now considered bad and routed to the chip/slab
+  // fallback like any other low-stats channel, rather than kept as-is.)
+  struct MipEntry {
+    double mpv = 0., empv = -10., width = 0., chi2ndf = 0., integral = 0.;
+    int status = 0;
+  };
+
+  /// The peak of a MIP spectrum, located on a REBINNED copy so that it is a
+  /// property of the distribution and not of whichever bin happened to get lucky.
+  double robustPeak(const TH1F& hist) const {
+    std::unique_ptr<TH1F> reb(static_cast<TH1F*>(hist.Clone("mip_peak_tmp")));
+    reb->SetDirectory(nullptr);
+    if (m_mipPeakRebin.value() > 1) {
+      reb->Rebin(m_mipPeakRebin.value());
+    }
+    reb->GetXaxis()->SetRangeUser(0., 100.);
+    return reb->GetXaxis()->GetBinCenter(reb->GetMaximumBin());
+  }
+
+  /// Do we believe this Langau fit's MPV?
+  ///
+  /// Scale-free by construction: the same two numbers mean the same thing for a
+  /// 600-entry channel and a 12M-entry slab -- which is exactly what chi2/ndf
+  /// could never do (see the fit-quality property block). Applied at ALL THREE
+  /// granularities, so a chip or slab fallback fit is now judged by the same
+  /// standard as a per-channel one, instead of by a looser ceiling that in
+  /// practice rejected every single one of them.
+  bool mpvIsTrustworthy(const k4siwecal::MipFitResult& r, const TH1F& hist, double lowlim, double highlim) const {
+    if (r.ndf <= 0 || r.mpv <= lowlim || r.mpv >= highlim) {
+      return false;
+    }
+    if (r.empv > 0. && r.empv > m_maxMipRelErr.value() * r.mpv) {
+      return false;  // the MPV is simply not determined (this is the low-statistics gate)
+    }
+    return std::fabs(robustPeak(hist) - r.mpv) <= m_mipHistMaxTol.value() * r.mpv;
+  }
+
+  // Fits + writes the MIP table from already-populated pedestal-like and
+  // MIP-like histogram grids -- same rationale as writePedestalTable:
+  // identical code path whether the grids were just built (runMip) or read
+  // back from a merged Mode=Fill file (fitMipFromHistograms).
+  StatusCode writeMipTable(std::vector<std::unique_ptr<TH1F>>& pedHist, std::vector<std::unique_ptr<TH1F>>& mipHist,
+                            bool highGain) {
+    std::ofstream fout(m_outputMipFile.value());
+    if (!fout) {
+      return error() << "Cannot open output file: " << m_outputMipFile.value() << endmsg, StatusCode::FAILURE;
+    }
+    fout << "#mip results PROTO15-TB2022-03\n";
+    fout << "#layer chip channel mpv empv widthmpv chi2ndf nentries\n";
+    // empv sentinel scheme: -10 = masked (mpv=0) -- the channel had exactly 0
+    // entries (it never fired this run) or no fallback was available anywhere;
+    // -5 = Langau fit failed (ndf<=0) and the histogram-peak fallback below
+    // was also unreasonable (masked); -6 = filled from a Langau fit to the
+    // whole SLAB's combined histogram (all 16 chips, tried after the chip fit
+    // and before the global average); -4 = no fit possible for this channel,
+    // its chip, or its slab, filled from the GLOBAL average of every
+    // genuinely-fit channel in the whole calibration; -3 = no usable
+    // statistics for this channel, filled from a Langau fit to the WHOLE
+    // CHIP's combined MIP histogram (all 64 channels x 15 SCA -- MIP response
+    // is expected to be reasonably uniform across channels of the same
+    // ASIC/chip, so this is a much better substitute than leaving the channel
+    // at 0); -2 = fit failed but the histogram-peak fallback was accepted (mpv
+    // is a rough peak estimate, not a real fit -- width/chi2ndf are left at 0);
+    // >=0 = a genuine fit; for these the written mpv is the Langau fit CURVE's
+    // MPV parameter (not the histogram peak bin). A fit that converges but is
+    // bad -- MPV outside the [MipLowLim, MipHighLim] window, or chi2/ndf above
+    // MaxMipChi2Ndf -- is NOT written as its own value: it is treated as a bad
+    // fit and routed to the -3/-4 fallback instead.
+    //
+    // IMPORTANT: the -3/-6 chip/slab fallbacks are applied to any channel
+    // that has SOME raw statistics (Integral > 0) but either not enough to fit
+    // (Integral <= MinMipIntegral), or whose own fit was bad (out of range or
+    // chi2/ndf too high). Only a channel with Integral==0 (it never fired at all in this
+    // run) is left masked (mpv=0, empv=-10) permanently -- it never reaches
+    // the fallback passes, however dry its chip is. There is
+    // nothing to calibrate
+    // for a channel that produced zero MIP-tagged hits, and inventing a
+    // value for it would silently misrepresent a dead/unread channel as a
+    // working one downstream (CalibrationTables::readPedestalFile-style
+    // consumers only see mpv, not the raw entry count).
+
+    // Range check, not just a floor (see MipLowLim/MipHighLim doc): a real
+    // MIP peak for this run/threshold sits well below the reference tool's
+    // original 45 ADC floor, so a bare lower bound alone would accept
+    // nothing; an upper bound also guards against a peak bin picked from
+    // noise/tail far out in the histogram.
+    const double lowlimDefault = highGain ? m_mipLowLim.value() : m_mipLowLimLowGain.value();
+    const double highlimDefault = highGain ? m_mipHighLim.value() : m_mipHighLimLowGain.value();
+    // Per-slab windows: a slab that ran at a discriminator of its own (slab 12,
+    // the FEV11 chip-on-board, at DAC 243 against the others' 215-230) has its
+    // MIP spectrum truncated and its fitted MPV pushed up -- 31-35 ADC where the
+    // rest sit at 20-27 -- and would otherwise be routed to the fallbacks by
+    // the detector-wide window.  Explicit "slab:low:high" entries first; then
+    // every slab the slab file marks with a threshold_dac of its own gets
+    // MipWindowThresholdSlabHigh as its upper bound (high gain only).
+    std::vector<std::pair<double, double>> window(kSlbDepth, {lowlimDefault, highlimDefault});
+    if (highGain) {
+      if (!m_slabZFile.value().empty()) {
+        const auto geom = k4siwecal::SlabGeometry::fromYamlFile(m_slabZFile.value());
+        for (int layer = 0; layer < kSlbDepth; ++layer) {
+          if (geom.thresholdDacOverride(layer) >= 0) {
+            window[layer].second = m_mipWindowThresholdSlabHigh.value();
+            info() << "MIP window: slab " << layer << " ran at DAC " << geom.thresholdDacOverride(layer)
+                   << " (its own), window [" << window[layer].first << ", " << window[layer].second
+                   << "] ADC" << endmsg;
+          }
+        }
+      }
+      for (const auto& entry : m_mipWindowSlabOverrides.value()) {
+        int slab = -1;
+        double lo = 0., hi = 0.;
+        char c1 = 0, c2 = 0;
+        std::istringstream in(entry);
+        if (!(in >> slab >> c1 >> lo >> c2 >> hi) || c1 != ':' || c2 != ':' || slab < 0 || slab >= kSlbDepth) {
+          error() << "MipWindowSlabOverrides entry '" << entry << "' is not 'slab:low:high'" << endmsg;
+          continue;
+        }
+        window[slab] = {lo, hi};
+        info() << "MIP window: slab " << slab << " [" << lo << ", " << hi << "] ADC (explicit)" << endmsg;
+      }
+    }
+
+    // Pass 1: compute the raw per-channel result (fit, histogram-peak
+    // fallback, or masked) exactly as before, but store it instead of
+    // writing it out immediately -- the chip/slab fallback pass below
+    // needs every channel's result available before it can average them.
+    std::vector<MipEntry> entries(static_cast<size_t>(kSlbDepth) * kSkirocsPerAsu * kChannelsInSkiroc);
+    auto chanIndex = [](int layer, int chip, int chn) {
+      return (static_cast<size_t>(layer) * kSkirocsPerAsu + chip) * kChannelsInSkiroc + chn;
+    };
+
+    for (int layer = 0; layer < kSlbDepth; ++layer) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          // Combine the 15 per-SCA MIP histograms into one, subtracting
+          // each SCA's own on-the-fly (truncated-mean) pedestal -- port of
+          // mipanalysis_summary's pedestal_mode=1 combination loop. Bin
+          // range/loop bounds (0..899, i.e. the underflow bin plus all but
+          // the last valid bin) match the reference exactly, quirks
+          // included.
+          TH1F hmips("hmips_tmp", "", 900, -100.5, 799.5);
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            const auto idx = histIndex(layer, chip, chn, sca);
+            TH1F& mh = *mipHist[idx];
+            TH1F& ph = *pedHist[idx];
+            double pedMean = 0.;
+            if (ph.GetEntries() > 0) {
+              ph.GetXaxis()->SetRangeUser(ph.GetMean() - 20, ph.GetMean() + 20);
+              pedMean = ph.GetMean();
+            }
+            if (pedMean <= 0) continue;
+            for (int k = 0; k < 900; ++k) {
+              const double y = mh.GetBinContent(k);
+              if (y > 0) {
+                hmips.Fill(static_cast<int>(mh.GetXaxis()->GetBinCenter(k) - pedMean), y);
+              }
+            }
+          }
+
+          MipEntry entry;
+          entry.integral = hmips.Integral();
+          if (entry.integral > m_minMipIntegral.value()) {
+            const auto r = k4siwecal::fitLangau(hmips, highGain);
+            if (r.ndf > 0) {
+              // Accept the fitted MPV only if we believe it: mpvIsTrustworthy()
+              // checks the MPV's own relative error (the low-statistics gate) and
+              // that the fit landed on the peak the data actually shows (the
+              // high-statistics gate). chi2/ndf is still computed and written out,
+              // but it no longer decides anything -- it cannot, it is not
+              // comparable across statistics.
+              //
+              // Failing that, prefer the spectrum's own peak over a fit we do not
+              // trust; and failing even that, leave status 0 for the chip/slab
+              // fallback (only a 0-entry channel is masked here).
+              const double histMax = robustPeak(hmips);
+              double mip1 = 0.;
+              for (int k = 0; k < 900; ++k) {
+                if (hmips.GetBinCenter(k) < r.mpv * 4) {
+                  mip1 += hmips.GetBinContent(k);
+                }
+              }
+              if (mip1 > 4. && mpvIsTrustworthy(r, hmips, window[layer].first, window[layer].second)) {
+                entry = {r.mpv, r.empv, r.width, r.chi2ndf, entry.integral, 1};
+              } else if (histMax > 0.0 && histMax <= m_mipFallbackMaxAdc.value()) {
+                entry = {histMax, -2., 0., 0., entry.integral, 2};
+              }
+              // else: fit not believed AND the peak itself is unreasonable ->
+              // status 0, resolved by the chip/slab fallback.
+            } else {
+              // Fit failed (ndf<=0): instead of masking immediately, check
+              // the combined histogram's peak bin as a rough MPV estimate
+              // (the same idea as the pre-Gaudi Python
+              // Calibration._compute_mips histogram-peak method). Accepted
+              // only if positive and within MipFallbackMaxAdc; otherwise
+              // leave it masked for the chip/slab fallback pass below.
+              const int peakBin = hmips.GetMaximumBin();
+              const double peakValue = hmips.GetXaxis()->GetBinCenter(peakBin);
+              if (peakValue > 0.0 && peakValue <= m_mipFallbackMaxAdc.value()) {
+                entry = {peakValue, -2., 0., 0., entry.integral, 2};
+              } else {
+                entry.status = 0;  // masked/lowstats -- resolved by the chip/slab fallback
+              }
+            }
+          }
+          entries[chanIndex(layer, chip, chn)] = entry;
+        }
+      }
+    }
+
+    // Pass 2: chip-level fallback. A masked channel (status==0) borrows the
+    // MPV of a Langau fit to the WHOLE CHIP's combined MIP histogram (all
+    // 64 channels x 15 SCA summed into one, each SCA still pedestal-
+    // subtracted the same way as the per-channel hmips in pass 1) -- port
+    // of the reference tool's hmip_chip cross-check
+    // (SiWECAL-TB-analysis/SLBperformance/TBchecks/analysis.h, ~line 368-
+    // 480), which fits that same combined histogram once it clears its own
+    // (much higher) integral threshold. A real fit on ~64x the statistics
+    // of a single channel is a far more robust fallback than averaging the
+    // handful (often zero or one) of already-fit donor channels in the
+    // chip, which is all an earlier version of this pass did.
+    int nChipFallback = 0;
+    for (int layer = 0; layer < kSlbDepth; ++layer) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        bool needsFallback = false;
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          if (entries[chanIndex(layer, chip, chn)].status == 0) {
+            needsFallback = true;
+            break;
+          }
+        }
+        if (!needsFallback) continue;  // every channel in this chip already has its own value
+
+        TH1F hmipsChip("hmips_chip_tmp", "", 900, -100.5, 799.5);
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            const auto idx = histIndex(layer, chip, chn, sca);
+            TH1F& mh = *mipHist[idx];
+            TH1F& ph = *pedHist[idx];
+            double pedMean = 0.;
+            if (ph.GetEntries() > 0) {
+              ph.GetXaxis()->SetRangeUser(ph.GetMean() - 20, ph.GetMean() + 20);
+              pedMean = ph.GetMean();
+            }
+            if (pedMean <= 0) continue;
+            for (int k = 0; k < 900; ++k) {
+              const double y = mh.GetBinContent(k);
+              if (y > 0) {
+                hmipsChip.Fill(static_cast<int>(mh.GetXaxis()->GetBinCenter(k) - pedMean), y);
+              }
+            }
+          }
+        }
+
+        if (hmipsChip.Integral() <= m_chipFallbackMinIntegral.value()) continue;  // still dry -- pass 2.5/3 handle it
+        const auto rChip = k4siwecal::fitLangau(hmipsChip, highGain);
+        // The chip-level fit must converge, have its MPV in range, and pass the
+        // Judged by exactly the same standard as a per-channel fit. It used to be
+        // judged by a looser chi2/ndf ceiling instead -- which was the wrong axis
+        // entirely: a chip carries ~64x a channel's statistics, so its chi2/ndf is
+        // inflated by that alone, not by being a worse fit. If not believed, the
+        // slab pass gets these channels; if that fails too, they are masked.
+        if (!mpvIsTrustworthy(rChip, hmipsChip, window[layer].first, window[layer].second)) {
+          continue;
+        }
+        const double peakMpvChip = rChip.mpv;
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          MipEntry& e = entries[chanIndex(layer, chip, chn)];
+          if (e.status != 0) continue;
+          // A channel with literally zero raw MIP entries (as opposed to
+          // "some entries but below MinMipIntegral") never triggered at all
+          // in this run -- there is nothing to calibrate, and no amount of
+          // fallback should invent a value for it. Leave it masked (mpv=0)
+          // permanently; do not count it as a fallback.
+          if (e.integral == 0.) continue;
+          e.mpv = peakMpvChip;
+          e.empv = -3.;
+          e.status = 4;
+          ++nChipFallback;
+        }
+      }
+    }
+
+    // Pass 2.5: slab (layer) level fallback. For any channel the chip fallback
+    // could not fill (chip histogram too dry, or its fit rejected), fit the
+    // WHOLE SLAB's combined MIP histogram (all 16 chips x 64 channels x 15 SCA,
+    // each SCA pedestal-subtracted the same way) BEFORE giving up to the flat
+    // detector-wide global average -- a per-slab MPV is far more local/correct
+    // for a low-MPV slab than the global mean. Uses the loose fallback chi2
+    // ceiling (a slab has ~1000x a channel's statistics, chi2/ndf ~8-17 even
+    // for a good fit).
+    int nSlabFallback = 0;
+    for (int layer = 0; layer < kSlbDepth; ++layer) {
+      bool needsFallback = false;
+      for (int chip = 0; chip < kSkirocsPerAsu && !needsFallback; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          const MipEntry& e = entries[chanIndex(layer, chip, chn)];
+          if (e.status == 0 && e.integral > 0.) {
+            needsFallback = true;
+            break;
+          }
+        }
+      }
+      if (!needsFallback) continue;
+
+      TH1F hmipsSlab("hmips_slab_tmp", "", 900, -100.5, 799.5);
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            const auto idx = histIndex(layer, chip, chn, sca);
+            TH1F& mh = *mipHist[idx];
+            TH1F& ph = *pedHist[idx];
+            double pedMean = 0.;
+            if (ph.GetEntries() > 0) {
+              ph.GetXaxis()->SetRangeUser(ph.GetMean() - 20, ph.GetMean() + 20);
+              pedMean = ph.GetMean();
+            }
+            if (pedMean <= 0) continue;
+            for (int k = 0; k < 900; ++k) {
+              const double y = mh.GetBinContent(k);
+              if (y > 0) {
+                hmipsSlab.Fill(static_cast<int>(mh.GetXaxis()->GetBinCenter(k) - pedMean), y);
+              }
+            }
+          }
+        }
+      }
+
+      if (hmipsSlab.Integral() <= m_chipFallbackMinIntegral.value()) continue;
+      const auto rSlab = k4siwecal::fitLangau(hmipsSlab, highGain);
+      // Same standard again. This is the gate that used to be impossible to pass:
+      // a slab carries ~1000x a channel's statistics, so its chi2/ndf sat around
+      // 8-17 for a perfectly good fit and the ceiling of 25 was still routinely
+      // exceeded -- the slab fallback fired ZERO times across all of th220, and
+      // channels that should have inherited their own slab's MPV (~25 in slab 14)
+      // fell through to the detector-wide average (22.6) instead.
+      if (!mpvIsTrustworthy(rSlab, hmipsSlab, window[layer].first, window[layer].second)) {
+        continue;  // slab fit not believed -- the channel is masked
+      }
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          MipEntry& e = entries[chanIndex(layer, chip, chn)];
+          if (e.status != 0 || e.integral == 0.) continue;
+          e.mpv = rSlab.mpv;
+          e.empv = -6.;
+          e.status = 6;
+          ++nSlabFallback;
+        }
+      }
+    }
+
+    // No global fallback. A channel that neither it, nor its chip, nor its slab
+    // could fit is MASKED -- it does not inherit a detector-wide average MPV.
+    //
+    // That average was a fiction. It pooled every fitted channel in the detector,
+    // including slab 12, the chip-on-board, whose table MPV sits at 1.2-1.9x the
+    // others' (~35 vs ~21.5 at th220).  That is NOT a gain "by design" -- a real
+    // gain would give the same factor in every threshold set, and it gives 1.91 /
+    // 1.63 / 1.22 in th210 / th220 / th230 -- it is the truncation of its MIP
+    // spectrum by the higher discriminator that slab ran at (DAC 243, see the
+    // threshold_dac list of common/mappings/slab_z_positions.yml).  Either way the
+    // "average MIP" it produced belongs to no real channel anywhere. The one channel that ever reached it in th220
+    // (slab 14, chip 0, channel 27) was handed 22.62 while its own slab's mean is
+    // 25.11 and its immediate neighbours fit at 23-26 -- a ~10% error on every hit
+    // that channel would ever record. A wrong MIP is worse than no MIP: a masked
+    // channel is excluded downstream and its absence is visible, whereas a
+    // fabricated one silently miscalibrates every event it touches.
+    //
+    // If a channel fired but nothing at any granularity could be fitted from it,
+    // that is a fact worth surfacing, not papering over.
+    int nStillMasked = 0;
+    int nZeroEntryMasked = 0;
+    for (const auto& e : entries) {
+      if (e.status != 0) continue;
+      if (e.integral == 0.) {
+        ++nZeroEntryMasked;  // never fired in this run
+      } else {
+        ++nStillMasked;      // fired, but unfittable at channel, chip AND slab level
+      }
+    }
+
+    // Optional cross-check plots (see DiagnosticsFile doc): 2D maps indexed
+    // like the reference tool's mpv_all (layer*20+chip, channel), plus a
+    // per-channel status code map (0=masked/nothing available anywhere,
+    // 1=genuine fit, 2=histogram-peak fallback, 3=fit-not-miplike,
+    // 4=chip-fit fallback, 6=slab-fit fallback; there is no global fallback) so the fallback
+    // policy's decisions are directly visible, and 1D distributions of the
+    // written MPV/chi2ndf.
+    std::unique_ptr<TFile> diagFile;
+    TH2F* hMpvMap = nullptr;
+    TH2F* hStatusMap = nullptr;
+    TH1F* hMpvDist = nullptr;
+    TH1F* hChi2NdfDist = nullptr;
+    if (!m_diagnosticsFile.value().empty()) {
+      diagFile.reset(TFile::Open(m_diagnosticsFile.value().c_str(), "RECREATE"));
+      if (!diagFile || diagFile->IsZombie()) {
+        return error() << "Cannot create diagnostics file: " << m_diagnosticsFile.value() << endmsg,
+               StatusCode::FAILURE;
+      }
+      diagFile->cd();
+      hMpvMap = new TH2F("mip_mpv_map", "MIP MPV; layer*20+chip; channel", 300, -0.5, 299.5, 64, -0.5, 63.5);
+      hStatusMap = new TH2F("mip_status_map",
+                             "MIP status (0=masked, 1=fit, 2=histfallback, "
+                             "4=chip-fallback, 6=slab-fallback; no global fallback); layer*20+chip; channel",
+                             300, -0.5, 299.5, 64, -0.5, 63.5);
+      hMpvDist = new TH1F("mip_mpv_dist", "MIP MPV distribution (fit or fallback); ADC", 200, 0.0, 400.0);
+      hChi2NdfDist = new TH1F("mip_chi2ndf_dist", "MIP fit chi2/ndf distribution (genuine fits only)", 100, 0.0, 20.0);
+    }
+
+    for (int layer = 0; layer < kSlbDepth; ++layer) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          const MipEntry& e = entries[chanIndex(layer, chip, chn)];
+          fout << layer << " " << chip << " " << chn << " " << e.mpv << " " << e.empv << " " << e.width << " "
+               << e.chi2ndf << " " << e.integral << "\n";
+          if (hMpvMap != nullptr) {
+            const double diagX = layer * 20 + chip;
+            const double diagY = chn;
+            hMpvMap->Fill(diagX, diagY, e.mpv);
+            hStatusMap->Fill(diagX, diagY, static_cast<double>(e.status));
+            if (e.status != 0) hMpvDist->Fill(e.mpv);
+            if (e.status == 1) hChi2NdfDist->Fill(e.chi2ndf);
+          }
+        }
+      }
+    }
+    if (diagFile) {
+      diagFile->cd();
+      // See the matching comment in runPedestal(): AddDirectory(kFALSE)
+      // means cd() alone doesn't register these -- Write() explicitly.
+      hMpvMap->Write();
+      hStatusMap->Write();
+      hMpvDist->Write();
+      hChi2NdfDist->Write();
+      diagFile->Close();
+      info() << "PedestalMipCalibrator: wrote MIP diagnostics to " << m_diagnosticsFile.value() << endmsg;
+    }
+    info() << "PedestalMipCalibrator: MIP fallback summary: " << nChipFallback << " channel(s) filled from their "
+           << "chip fit, " << nSlabFallback << " channel(s) filled from their slab fit, " << nZeroEntryMasked
+           << " channel(s) masked (zero raw MIP entries -- never fired in this run)" << endmsg;
+    if (nStillMasked > 0) {
+      // Not a detail: these channels DID fire, and nothing at any granularity
+      // could be fitted from them. They used to be quietly handed the
+      // detector-wide average MPV. Now they are masked, and said out loud.
+      warning() << "PedestalMipCalibrator: " << nStillMasked
+                << " channel(s) had MIP statistics but could not be fitted at channel, chip OR slab level -- "
+                << "MASKED (no MIP). Investigate before trusting this calibration." << endmsg;
+    }
+    info() << "PedestalMipCalibrator: wrote MIP table to " << m_outputMipFile.value() << endmsg;
+    return StatusCode::SUCCESS;
+  }
+
+  // Mode=Fill: one forEachSelectedSca pass builds all 4 histogram grids
+  // (both gains x ped/mip) at once -- avoids re-reading the same input
+  // tree once per gain/mode the way the Condor pipeline's Fill stage would
+  // otherwise need to. "ped_high"/"ped_low" here are the same thing
+  // runPedestal calls "ped" and runMip calls "mipped" (identical binning,
+  // identical hitbit==0 fill condition) -- built once, reused by both
+  // fitPedestalFromHistograms and fitMipFromHistograms's on-the-fly
+  // pedestal subtraction.
+  StatusCode runFill() {
+    auto pedHigh = makeHistograms("ped_high", kPedNBins, kPedLo, kPedHi);
+    auto pedLow = makeHistograms("ped_low", kPedNBins, kPedLo, kPedHi);
+    auto mipHigh = makeHistograms("mip_high", kMipNBins, kMipLo, kMipHi);
+    auto mipLow = makeHistograms("mip_low", kMipNBins, kMipLo, kMipHi);
+
+    const auto sc = forEachSelectedSca([&](TreeBuffers& buf, int slab, int chip, int sca) {
+      for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+        const auto idx = histIndex(slab, chip, chn, sca);
+        const int hitbitHigh = buf.hitbitHigh[slab][chip][sca][chn];
+        const int hitbitLow = buf.hitbitLow[slab][chip][sca][chn];
+        if (hitbitHigh == 0) {
+          pedHigh[idx]->Fill(buf.adcHigh[slab][chip][sca][chn]);
+        } else if (hitbitHigh == 1) {
+          mipHigh[idx]->Fill(buf.adcHigh[slab][chip][sca][chn]);
+        }
+        if (hitbitLow == 0) {
+          pedLow[idx]->Fill(buf.adcLow[slab][chip][sca][chn]);
+        } else if (hitbitLow == 1) {
+          mipLow[idx]->Fill(buf.adcLow[slab][chip][sca][chn]);
+        }
+      }
+    });
+    if (!sc.isSuccess()) return sc;
+
+    std::unique_ptr<TFile> fout(TFile::Open(m_outputHistogramFile.value().c_str(), "RECREATE"));
+    if (!fout || fout->IsZombie()) {
+      return error() << "Cannot create output histogram file: " << m_outputHistogramFile.value() << endmsg,
+             StatusCode::FAILURE;
+    }
+    fout->cd();
+    // Zero-suppression is mandatory, not an optimization: at kNumHist=230400
+    // cells per grid x 4 grids, an unsuppressed file is ~300MB even
+    // completely empty (TH1F/TAxis object overhead dominates over bin
+    // content at this object count) -- a single large run's worth of
+    // per-chunk Fill files would otherwise blow past the available EOS
+    // scratch. A missing key is treated as an empty histogram on the read
+    // side (readHistogramGrid), so this is safe.
+    std::size_t written = 0;
+    std::size_t total = 0;
+    for (auto* grid : {&pedHigh, &pedLow, &mipHigh, &mipLow}) {
+      for (auto& h : *grid) {
+        ++total;
+        if (h->GetEntries() > 0) {
+          h->Write();
+          ++written;
+        }
+      }
+    }
+    fout->Close();
+    info() << "PedestalMipCalibrator: wrote " << written << "/" << total << " non-empty histograms to "
+           << m_outputHistogramFile.value() << endmsg;
+    return StatusCode::SUCCESS;
+  }
+
+  // Reconstructs one histogram grid from a (possibly hadd-merged) Mode=Fill
+  // output file. A missing key means every contributing Fill job saw zero
+  // entries for that cell (zero-suppressed on write) -- reconstructed as an
+  // empty histogram, not an error, so the fit code downstream sees exactly
+  // what it would have if the grid had never been zero-suppressed.
+  std::vector<std::unique_ptr<TH1F>> readHistogramGrid(TFile& file, const char* prefix, int nbins, double lo,
+                                                        double hi) const {
+    std::vector<std::unique_ptr<TH1F>> hist(kNumHist);
+    for (int slab = 0; slab < kSlbDepth; ++slab) {
+      for (int chip = 0; chip < kSkirocsPerAsu; ++chip) {
+        for (int chn = 0; chn < kChannelsInSkiroc; ++chn) {
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            const auto idx = histIndex(slab, chip, chn, sca);
+            auto* h = file.Get<TH1F>(Form("%s_s%d_c%d_ch%d_sca%d", prefix, slab, chip, chn, sca));
+            if (h != nullptr) {
+              // AddDirectory(kFALSE) (top of initialize()) means this isn't
+              // owned by `file` -- safe to keep past file.Close().
+              hist[idx] = std::unique_ptr<TH1F>(h);
+            } else {
+              hist[idx] = std::make_unique<TH1F>("", "", nbins, lo, hi);
+            }
+          }
+        }
+      }
+    }
+    return hist;
+  }
+
+  // Mode=FitPedestal: reads InputHistogramFile (the hadd-merged output of
+  // one or more Mode=Fill runs) instead of building histograms from
+  // InputFiles trees, then reuses writePedestalTable verbatim -- same fit,
+  // robustness policy and diagnostics as the sequential Mode=Pedestal path.
+  StatusCode fitPedestalFromHistograms(bool highGain) {
+    std::unique_ptr<TFile> fin(TFile::Open(m_inputHistogramFile.value().c_str(), "READ"));
+    if (!fin || fin->IsZombie()) {
+      return error() << "Cannot open input histogram file: " << m_inputHistogramFile.value() << endmsg,
+             StatusCode::FAILURE;
+    }
+    auto hist = readHistogramGrid(*fin, highGain ? "ped_high" : "ped_low", kPedNBins, kPedLo, kPedHi);
+    fin->Close();
+    return writePedestalTable(hist);
+  }
+
+  // Mode=FitMip: same idea as fitPedestalFromHistograms, but also reads the
+  // ped_high/ped_low grid (Mode=Fill's replacement for runMip's "mipped"
+  // grid -- identical binning/fill condition, see runFill) for the
+  // on-the-fly pedestal subtraction writeMipTable already does.
+  StatusCode fitMipFromHistograms(bool highGain) {
+    std::unique_ptr<TFile> fin(TFile::Open(m_inputHistogramFile.value().c_str(), "READ"));
+    if (!fin || fin->IsZombie()) {
+      return error() << "Cannot open input histogram file: " << m_inputHistogramFile.value() << endmsg,
+             StatusCode::FAILURE;
+    }
+    auto pedHist = readHistogramGrid(*fin, highGain ? "ped_high" : "ped_low", kPedNBins, kPedLo, kPedHi);
+    auto mipHist = readHistogramGrid(*fin, highGain ? "mip_high" : "mip_low", kMipNBins, kMipLo, kMipHi);
+    fin->Close();
+    return writeMipTable(pedHist, mipHist, highGain);
+  }
+
+  // Mode=FitTrigger: the trigger turn-on from a merged Fill file. Per channel,
+  // ped_high (hit bit 0) and mip_high (hit bit 1) of every SCA are moved onto
+  // one axis, ADC above that SCA's pedestal; the efficiency is mip/(ped+mip).
+  // Fits: all slabs, each slab, each chip (mu, sigma, plateau free) and each
+  // channel (mu free, sigma and plateau its chip's). A cell without the
+  // statistics for its own fit takes the level above (channel -> chip -> slab
+  // -> all slabs), recorded in the status column. Masked channels stay out of
+  // the sums. Only the high gain: the trigger is the fast shaper's
+  // hitbit_high.
+  StatusCode fitTriggerFromHistograms() {
+    using k4siwecal::kTurnOnHi;
+    using k4siwecal::kTurnOnLo;
+    using k4siwecal::kTurnOnNBins;
+    using k4siwecal::TurnOnFit;
+
+    bool ok = true;
+    std::string err;
+    const auto tables = k4siwecal::CalibrationTables::fromFiles(m_inputPedestalFile.value(),
+                                                                m_inputMipFile.value(), 250., 1., ok, err);
+    if (!ok) return error() << "FitTrigger: " << err << endmsg, StatusCode::FAILURE;
+
+    std::unique_ptr<TFile> fin(TFile::Open(m_inputHistogramFile.value().c_str(), "READ"));
+    if (!fin || fin->IsZombie()) {
+      return error() << "Cannot open input histogram file: " << m_inputHistogramFile.value() << endmsg,
+             StatusCode::FAILURE;
+    }
+    auto pedHist = readHistogramGrid(*fin, "ped_high", kPedNBins, kPedLo, kPedHi);
+    auto mipHist = readHistogramGrid(*fin, "mip_high", kMipNBins, kMipLo, kMipHi);
+    fin->Close();
+
+    auto newHist = [](const std::string& name) {
+      auto h = std::make_unique<TH1D>(name.c_str(), "", kTurnOnNBins, kTurnOnLo, kTurnOnHi);
+      h->SetDirectory(nullptr);
+      return h;
+    };
+    const int nChip = kSlbDepth * kSkirocsPerAsu;
+    const int nChan = nChip * kChannelsInSkiroc;
+    std::vector<std::unique_ptr<TH1D>> chPass(nChan), chTot(nChan), cPass(nChip), cTot(nChip),
+        sPass(kSlbDepth), sTot(kSlbDepth);
+    std::vector<char> masked(nChan, 0);
+    auto allPass = newHist("all_pass"), allTot = newHist("all_tot");
+    for (int s = 0; s < kSlbDepth; ++s) {
+      sPass[s] = newHist(Form("s%d_pass", s));
+      sTot[s] = newHist(Form("s%d_tot", s));
+    }
+    for (int s = 0; s < kSlbDepth; ++s) {
+      for (int c = 0; c < kSkirocsPerAsu; ++c) {
+        const int ic = s * kSkirocsPerAsu + c;
+        cPass[ic] = newHist(Form("s%d_c%d_pass", s, c));
+        cTot[ic] = newHist(Form("s%d_c%d_tot", s, c));
+        for (int ch = 0; ch < kChannelsInSkiroc; ++ch) {
+          const int ich = ic * kChannelsInSkiroc + ch;
+          chPass[ich] = newHist(Form("s%d_c%d_ch%d_pass", s, c, ch));
+          chTot[ich] = newHist(Form("s%d_c%d_ch%d_tot", s, c, ch));
+          if (tables.isMasked(s, c, ch)) {
+            masked[ich] = 1;
+            continue;
+          }
+          for (int sca = 0; sca < kScasInSkiroc; ++sca) {
+            const double ped = tables.pedestal(s, c, ch, sca);
+            const auto idx = histIndex(s, c, ch, sca);
+            const TH1F& hp = *pedHist[idx];
+            const TH1F& hm = *mipHist[idx];
+            for (int b = 1; b <= hp.GetNbinsX(); ++b) {
+              const double w = hp.GetBinContent(b);
+              if (w > 0.) chTot[ich]->Fill(hp.GetBinCenter(b) - ped, w);
+            }
+            for (int b = 1; b <= hm.GetNbinsX(); ++b) {
+              const double w = hm.GetBinContent(b);
+              if (w <= 0.) continue;
+              chPass[ich]->Fill(hm.GetBinCenter(b) - ped, w);
+              chTot[ich]->Fill(hm.GetBinCenter(b) - ped, w);
+            }
+          }
+          cPass[ic]->Add(chPass[ich].get());
+          cTot[ic]->Add(chTot[ich].get());
+        }
+        sPass[s]->Add(cPass[ic].get());
+        sTot[s]->Add(cTot[ic].get());
+      }
+      allPass->Add(sPass[s].get());
+      allTot->Add(sTot[s].get());
+    }
+    pedHist.clear();
+    mipHist.clear();
+
+    // DiagnosticsFile: the summed turn-on histograms (all slabs, per slab, per chip), written before any fit so
+    // a fit that misbehaves can be looked at offline.
+    if (!m_diagnosticsFile.value().empty()) {
+      std::unique_ptr<TFile> fd(TFile::Open(m_diagnosticsFile.value().c_str(), "RECREATE"));
+      if (fd && !fd->IsZombie()) {
+        fd->cd();
+        allPass->Write();
+        allTot->Write();
+        for (int s = 0; s < kSlbDepth; ++s) {
+          sPass[s]->Write();
+          sTot[s]->Write();
+        }
+        for (int ic = 0; ic < nChip; ++ic) {
+          if (cTot[ic]->GetEntries() > 0) {
+            cPass[ic]->Write();
+            cTot[ic]->Write();
+          }
+        }
+        fd->Close();
+      } else {
+        warning() << "FitTrigger: cannot write diagnostics file " << m_diagnosticsFile.value() << endmsg;
+      }
+    }
+
+    const double minChip = m_triggerMinPassChip.value();
+    const TurnOnFit all = k4siwecal::fitTurnOn(*allPass, *allTot, minChip, minChip);
+    if (all.status != 0) {
+      return error() << "FitTrigger: the all-slab turn-on cannot be fitted (" << all.nPass << " hit-bit readouts)"
+                     << endmsg,
+             StatusCode::FAILURE;
+    }
+    info() << "FitTrigger: all slabs mu = " << all.mu << " ADC, sigma = " << all.sigma
+           << ", plateau = " << all.plateau << endmsg;
+
+    std::vector<TurnOnFit> slabFit(kSlbDepth), chipFit(nChip), chanFit(nChan);
+    std::vector<int> slabStatus(kSlbDepth), chipStatus(nChip), chanStatus(nChan);
+    auto take = [](TurnOnFit& dst, const TurnOnFit& src) {
+      dst.mu = src.mu;
+      dst.sigma = src.sigma;
+      dst.plateau = src.plateau;
+    };
+    for (int s = 0; s < kSlbDepth; ++s) {
+      slabFit[s] = k4siwecal::fitTurnOn(*sPass[s], *sTot[s], minChip, minChip);
+      slabStatus[s] = slabFit[s].status == 0 ? 0 : 2;
+      if (slabStatus[s] != 0) take(slabFit[s], all);
+    }
+    int nChipOwn = 0, nChanOwn = 0, nChanMasked = 0;
+    for (int ic = 0; ic < nChip; ++ic) {
+      const int s = ic / kSkirocsPerAsu;
+      chipFit[ic] = k4siwecal::fitTurnOn(*cPass[ic], *cTot[ic], minChip, minChip);
+      if (chipFit[ic].status == 0) {
+        chipStatus[ic] = 0;
+        ++nChipOwn;
+      } else {
+        chipStatus[ic] = slabStatus[s] == 0 ? 1 : 2;
+        take(chipFit[ic], slabFit[s]);
+      }
+      const TurnOnFit& chip = chipFit[ic];
+      for (int ch = 0; ch < kChannelsInSkiroc; ++ch) {
+        const int ich = ic * kChannelsInSkiroc + ch;
+        TurnOnFit own;
+        if (!masked[ich]) {
+          // Enough readouts where mu is actually measured: inside the chip's turn-on.
+          const double inside = chTot[ich]->Integral(chTot[ich]->FindBin(chip.mu - 2. * chip.sigma),
+                                                     chTot[ich]->FindBin(chip.mu + 2. * chip.sigma));
+          if (inside >= m_triggerMinTurnOnChannel.value()) {
+            own = k4siwecal::fitTurnOn(*chPass[ich], *chTot[ich], m_triggerMinPassChannel.value(), 0.,
+                                       chip.sigma, chip.plateau);
+          } else {
+            own.nPass = chPass[ich]->Integral();
+            own.nTotal = chTot[ich]->Integral();
+          }
+        }
+        chanFit[ich] = own;
+        if (masked[ich]) {
+          chanStatus[ich] = 3;
+          ++nChanMasked;
+          take(chanFit[ich], chip);
+        } else if (own.status == 0) {
+          chanStatus[ich] = 0;
+          ++nChanOwn;
+          chanFit[ich].sigma = chip.sigma;
+          chanFit[ich].plateau = chip.plateau;
+        } else {
+          chanStatus[ich] = 1;
+          take(chanFit[ich], chip);
+        }
+      }
+    }
+
+    auto open = [this](const std::string& path, std::ofstream& out) {
+      out.open(path);
+      if (!out) error() << "FitTrigger: cannot write " << path << endmsg;
+      return static_cast<bool>(out);
+    };
+    auto row = [](std::ofstream& out, const TurnOnFit& f, int status) {
+      out << Form(" %.3f %.3f %.4f %.0f %.0f %d\n", f.mu, f.sigma, f.plateau, f.nPass, f.nTotal, status);
+    };
+    const std::string src = " (PedestalMipCalibrator Mode=FitTrigger, " + m_inputHistogramFile.value() + ")";
+    std::ofstream fc, fch;
+    if (!open(m_outputTriggerChipFile.value(), fc) || !open(m_outputTriggerChannelFile.value(), fch)) {
+      return StatusCode::FAILURE;
+    }
+    fc << "#trigger turn-on per chip, ADC above the pedestal" << src << "\n"
+       << "#P(x) = plateau * 0.5 * (1 + erf((x - mu) / (sqrt(2) * sigma))); status 0 own fit, 1 slab's, "
+          "2 all slabs'\n#layer chip mu_adc sigma_adc plateau npass ntotal status\n";
+    fch << "#trigger turn-on per channel, ADC above the pedestal" << src << "\n"
+        << "#status 0 own mu (sigma, plateau of the chip), 1 chip's values, 3 masked (chip's values)\n"
+        << "#layer chip channel mu_adc sigma_adc plateau npass ntotal status\n";
+    for (int ic = 0; ic < nChip; ++ic) {
+      fc << ic / kSkirocsPerAsu << " " << ic % kSkirocsPerAsu;
+      row(fc, chipFit[ic], chipStatus[ic]);
+      for (int ch = 0; ch < kChannelsInSkiroc; ++ch) {
+        const int ich = ic * kChannelsInSkiroc + ch;
+        fch << ic / kSkirocsPerAsu << " " << ic % kSkirocsPerAsu << " " << ch;
+        row(fch, chanFit[ich], chanStatus[ich]);
+      }
+    }
+    if (!m_outputTriggerSlabFile.value().empty()) {
+      std::ofstream fs;
+      if (!open(m_outputTriggerSlabFile.value(), fs)) return StatusCode::FAILURE;
+      fs << "#trigger turn-on per slab, ADC above the pedestal" << src << "\n"
+         << "#status 0 own fit, 2 all slabs'\n#layer mu_adc sigma_adc plateau npass ntotal status\n";
+      for (int s = 0; s < kSlbDepth; ++s) {
+        fs << s;
+        row(fs, slabFit[s], slabStatus[s]);
+      }
+    }
+    info() << "FitTrigger: " << nChipOwn << "/" << nChip << " chips with a fit of their own, " << nChanOwn << "/"
+           << nChan - nChanMasked << " unmasked channels with their own threshold (" << nChanMasked
+           << " masked)" << endmsg;
+    return StatusCode::SUCCESS;
+  }
+};
+
+DECLARE_COMPONENT(PedestalMipCalibrator)

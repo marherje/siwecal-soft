@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Shared configuration of siwecal-soft (data conversion, simulation, analysis).
+#
+# Copy this file to `settings.yml` and edit the paths for your machine. It is
+# read by every package through `siwecal_common.paths` (and by shell scripts via
+# `python3 -m siwecal_common <key>`), so it is the ONLY
+# place where filesystem locations are defined.
+#
+# Relative paths (./something) resolve against the repo root. Absolute paths are
+# used as-is. You can also point to a different file with $SIWECAL_SETTINGS.
+# ---------------------------------------------------------------------------
+
+# Where the (heavy) per-run / per-event ROOT files live. These are NOT part of
+# the repo. Provide a single path or a LIST of search roots: inputs are looked
+# up in each, in order, and the first match wins. Absolute paths written inside
+# the data_reference*.yml files always take precedence and are used verbatim.
+data_dir:
+  - /path/to/your/TB2026CERN/data
+  # - /eos/another/place/with/events
+
+# Calibration (pedestal + MIP) files. Default: the project EOS area, whose
+# MuonCalib/ holds the official tables (fixed SCA pairing, {pedestals,mips,anchor,trigger}/th<N>/)
+# and the dummy_*.txt maps. No calibration table is kept in the repo.
+calib_dir: /eos/experiment/drdcalo/siw-ecal/TB2026-06/Calib
+
+# Geometry inputs: pad (chip,channel)->(x,y) maps + slab z + tungsten map.
+geometry_dir: ./common/mappings
+
+# Run-list configs (data_reference*.yml: energy/run -> events mapping).
+configs_dir: ./analysis/configs/data
+
+# Where the reconstruction lives: one folder per run, holding BOTH that run's
+# reconstructed events (ecal_<run>.root / ecal_<run>.edm4hep.root, written by the
+# CONVERT+RECO DAG) and the validation plots/results made from them.
+#
+# Deliberately OUTSIDE the Data/ tree. Data/ holds the raw chunks and the decoded
+# chunks -- what cannot be recreated. Everything below the event builder is a
+# product: it is regenerated whenever the calibration or the geometry changes, so
+# it belongs somewhere that can be wiped without risking a byte of data.
+reconstruction_dir: /eos/experiment/drdcalo/siw-ecal/TB2026-06/Reconstruction
+
+# Simulation area: Processed/<campaign> (final_v9, ...) and tests/<study>.
+simulation_dir: /eos/experiment/drdcalo/siw-ecal/TB2026-06/Simulation
+
+# Default output base for validation plots / results tables.
+#   null -> reconstruction_dir (the default): the validation labels each sample by
+#           run name and writes <base>/<label>/<category>/, so a run's plots land
+#           in Reconstruction/<RUN>/, beside the events they were made from.
+#   path -> collect all validation output somewhere else instead.
+output_dir: null
+
+# Where the PID stage (reconstruction/jobs/run_pid_batch.py) writes (and siwecal_validation / event_viewer look for) the
+# per-run reconstruction output: ecal_<run>.edm4hep.root / ecal_<run>.valtree.root.
+#   null  -> next to each input file (default; needs a writable data dir)
+#   path  -> all outputs go here (use this when the data dir is read-only)
+pid_dir: null
+
+# Legacy *.valcache.root metric caches (still read by event_viewer if present).
+# siwecal_validation no longer writes these; metrics come from pid_dir above.
+#   null  -> next to each input file (default)
+#   path  -> all caches go here
+cache_dir: null

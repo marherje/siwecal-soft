@@ -1,0 +1,117 @@
+#
+# Gaudi/k4FWCore steering: siwecaldecoded ROOT tree -> reconstructed `ecal`
+# tree (event building), via the EcalEventBuilder component.
+#
+#   EVBLD_INPUT=/path/run.root \
+#   EVBLD_OUTPUT=/path/ecal_run.root \
+#   EVBLD_PEDESTAL_FILE=/path/Pedestal_..._highgain.txt \
+#   EVBLD_MIP_FILE=/path/MIP_pedestalsubmode1_..._highgain.txt \
+#   EVBLD_PEDESTAL_FILE_LOWGAIN=/path/Pedestal_..._lowgain.txt \
+#   EVBLD_MIP_FILE_LOWGAIN=/path/MIP_pedestalsubmode1_..._lowgain.txt \
+#       k4run data_conversion/options/run_event_builder.py
+#
+# threshold_dac is read directly from the siwecaldecoded tree's thresholdDac
+# branch (written by EcalRawDecoder from Run_Settings.txt) -- this steering
+# does not need to pass it explicitly unless EVBLD_THRESHOLD_DAC_OVERRIDE is
+# set (e.g. for siwecaldecoded files predating that branch).
+#
+# All work happens in EcalEventBuilder::initialize(); EvtMax=1 is enough
+# since execute() is a no-op (this is a global reduction over an entire run,
+# not a per-event k4FWCore transform -- see EcalEventBuilder.cpp).
+import glob
+import os
+
+from Gaudi.Configuration import INFO
+from Configurables import EventDataSvc
+from Configurables import EcalEventBuilder
+from k4FWCore import ApplicationMgr
+
+# EVBLD_INPUT is one siwecaldecoded file; EVBLD_INPUT_FILES is a comma-separated
+# list (or a glob) of them, chained in order -- that is how a run decoded in
+# parallel is event-built straight from its chunks, with no merge step. The
+# output is a single ecal file either way.
+input_file = os.environ.get("EVBLD_INPUT", "")
+input_files_raw = os.environ.get("EVBLD_INPUT_FILES", "")
+input_files = [f.strip() for f in input_files_raw.split(",") if f.strip()]
+if len(input_files) == 1 and glob.has_magic(input_files[0]):
+    input_files = sorted(glob.glob(input_files[0]))
+    if not input_files:
+        raise SystemExit(f"EVBLD_INPUT_FILES glob matched nothing: {input_files_raw}")
+if not input_file and not input_files:
+    raise SystemExit("Set EVBLD_INPUT (one file) or EVBLD_INPUT_FILES (comma-separated list, or a glob)")
+
+output_file = os.environ.get("EVBLD_OUTPUT", "")
+if not output_file:
+    raise SystemExit("Set EVBLD_OUTPUT to the output ecal ROOT file path")
+
+no_calibration = os.environ.get("EVBLD_NO_CALIBRATION", "0") == "1"
+pedestal_file = os.environ.get("EVBLD_PEDESTAL_FILE", "")
+mip_file = os.environ.get("EVBLD_MIP_FILE", "")
+# Low-gain tables: optional, but only useful as a pair. With both set, a hit whose
+# raw adc_high >= AdcSaturationThreshold takes its energy from the low-gain branch
+# (the high-gain preamp is saturated there); with neither, the energy always comes
+# from the high gain, as before low-gain support existed.
+pedestal_file_lg = os.environ.get("EVBLD_PEDESTAL_FILE_LOWGAIN", "")
+mip_file_lg = os.environ.get("EVBLD_MIP_FILE_LOWGAIN", "")
+if not no_calibration and (not pedestal_file or not mip_file):
+    raise SystemExit("Set EVBLD_PEDESTAL_FILE and EVBLD_MIP_FILE, or EVBLD_NO_CALIBRATION=1 for raw-ADC mode")
+
+pad_map_overrides = [e for e in os.environ.get("EVBLD_PADMAP_SLAB_OVERRIDES", "").split(",") if e.strip()]
+slab_z_file = os.environ.get("EVBLD_SLAB_Z_FILE", "")
+if not pad_map_overrides and slab_z_file:
+    # Which slabs need a pad map of their own is the technology block of the
+    # slab file (slab 12, the FEV11 chip-on-board); nothing here says "12".
+    try:
+        from siwecal_eventbuilder.geometry import load_slab_technology
+        pad_map_overrides = [f"{s}:{path}" for s, path in
+                             sorted(load_slab_technology(slab_z_file).pad_map_overrides().items())]
+    except ImportError:
+        pass   # the package is not on PYTHONPATH: the explicit env var is the only way
+
+builder = EcalEventBuilder(
+    "EcalEventBuilder",
+    InputFile=input_file,
+    InputFiles=input_files,
+    TreeName=os.environ.get("EVBLD_TREE", "siwecaldecoded"),
+    OutputFile=output_file,
+    RunId=int(os.environ.get("EVBLD_RUN_ID", "-1")),
+    ThresholdDacOverride=int(os.environ.get("EVBLD_THRESHOLD_DAC_OVERRIDE", "-1")),
+    NoCalibration=no_calibration,
+    PedestalFile=pedestal_file,
+    MipFile=mip_file,
+    PedestalFileLowGain=pedestal_file_lg,
+    MipFileLowGain=mip_file_lg,
+    AdcSaturationThreshold=int(os.environ.get("EVBLD_ADC_SATURATION", "1500")),
+    # BCID merge distance -- the effective event-building "time window": two BCIDs
+    # land in the same event iff they are < MergeDelta apart. 1 means no merging
+    # at all (one event per BCID). See docs/data/gaudi_source.md.
+    MergeDelta=int(os.environ.get("EVBLD_MERGE_DELTA", "3")),
+    MinSlabsHit=int(os.environ.get("EVBLD_MIN_SLABS_HIT", "10")),
+    DropRetriggerScas=os.environ.get("EVBLD_DROP_RETRIGGER", "0") == "1",
+    DropRetriggerDelta=int(os.environ.get("EVBLD_RETRIGGER_DELTA", "2")),
+    # LG->HG anchor line (per threshold, from <calib_dir>/MuonCalib/anchor/thN/ on EOS).
+    # Defaults keep the previous global values if unset.
+    GainRatio=float(os.environ.get("EVBLD_GAIN_RATIO", "0.0962")),
+    GainIntercept=float(os.environ.get("EVBLD_GAIN_INTERCEPT", "1.45")),
+    PadMapDefaultFile=os.environ.get("EVBLD_PADMAP_DEFAULT", ""),
+    PadMapSlabOverrides=pad_map_overrides,
+    SlabZFile=os.environ.get("EVBLD_SLAB_Z_FILE", ""),
+    NoMapping=os.environ.get("EVBLD_NO_MAPPING", "0") == "1",
+    # 'hitbit' (default) or 'adc': see BuilderConfig::hitSelection in EventBuilder.h
+    HitSelection=os.environ.get("EVBLD_HIT_SELECTION", "hitbit"),
+    AdcHitThreshold=float(os.environ.get("EVBLD_ADC_HIT_THRESHOLD", "30")),
+    # Chip trigger bursts (>= 3 SCAs per chip-window, samples at the pedestal): see BuilderConfig::chipNoiseVeto.
+    # ON by default; EVBLD_CHIP_NOISE_VETO=0 switches it off.
+    ChipNoiseVeto=os.environ.get("EVBLD_CHIP_NOISE_VETO", "1") not in ("0", "", "no", "false"),
+    ChipNoiseMinScas=int(os.environ.get("EVBLD_CHIP_NOISE_MIN_SCAS", "3")),
+    ChipNoiseMinBits=int(os.environ.get("EVBLD_CHIP_NOISE_MIN_BITS", "40")),
+    ChipNoiseMaxMedianAdc=float(os.environ.get("EVBLD_CHIP_NOISE_MAX_MEDIAN_ADC", "20")),
+    # EVBLD_SINGLE_RUN_ONLY=1: write only the events alone in their DAQ acquisition (single_run == 1).
+    SingleRunOnly=os.environ.get("EVBLD_SINGLE_RUN_ONLY", "0") == "1",
+)
+
+ApplicationMgr(TopAlg=[builder],
+               EvtSel="NONE",
+               EvtMax=1,
+               ExtSvc=[EventDataSvc("EventDataSvc")],
+               OutputLevel=INFO)

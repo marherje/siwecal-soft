@@ -1,0 +1,11 @@
+# condor_submit tools/validation/make_mu_sample.sub   (from the repo root, init_siwecalsoft.sh sourced)
+universe       = vanilla
+executable     = /bin/bash
+arguments      = $ENV(SIWECAL_SOFT_ROOT)/tools/validation/make_mu_sample.sh 2000
+output         = $ENV(SIWECAL_SOFT_ROOT)/work/make_mu_sample.out
+error          = $ENV(SIWECAL_SOFT_ROOT)/work/make_mu_sample.err
+log            = $ENV(SIWECAL_SOFT_ROOT)/work/make_mu_sample.log
+request_memory = 4000
+getenv         = False
++JobFlavour    = "workday"
+queue

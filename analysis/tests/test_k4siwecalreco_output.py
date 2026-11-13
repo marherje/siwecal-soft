@@ -1,0 +1,233 @@
+"""
+Integration tests for the SiWEcalPID output produced by run_pid_sim.sh.
+
+Validates that:
+  - ecal_sim.edm4hep.root exists and has the expected EDM4hep schema
+  - all 23 shower variables are present
+  - per-layer profiles (15 layers) are present
+  - physical values are consistent with 5 GeV muons traversing the detector
+
+Run with:
+    source init_siwecalsoft.sh
+    cd $SIWECAL_SOFT_ROOT
+    python -m pytest analysis/tests/test_k4siwecalreco_output.py -v
+
+Requires run_pid_sim.sh to have been executed first.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import pytest
+import numpy as np
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# The 50k-muon sample these tests read (digitised EDM4hep, ecal tree, PID output): produced by
+# simulation/campaign/run_pid_sim.sh into SIWECAL_MU_SAMPLE_DIR (default work/mu_beam, git-ignored).
+MU_SAMPLE_DIR = os.environ.get("SIWECAL_MU_SAMPLE_DIR", os.path.join(REPO_ROOT, "work", "mu_beam"))
+sys.path.insert(0, REPO_ROOT)
+
+EDM4HEP_FILE = os.path.join(MU_SAMPLE_DIR, "ecal_sim.edm4hep.root"
+)
+VALTREE_FILE = os.path.join(MU_SAMPLE_DIR, "ecal_sim.valtree.root"
+)
+# The ecal TTree the PID ran on; test_event_count derives the expected count
+# from it rather than hardcoding one.
+ECAL_TREE_FILE = os.path.join(MU_SAMPLE_DIR, "ecal_sim.root"
+)
+
+
+# ------------------------------------------------------------------ #
+# Skip guard                                                          #
+# ------------------------------------------------------------------ #
+def _check():
+    if not os.path.exists(EDM4HEP_FILE):
+        return f"run_pid_sim.sh output not found: {EDM4HEP_FILE}"
+    try:
+        import podio  # noqa: F401
+        from siwecal_common.edm4hep_pid import PidFileReader  # noqa: F401
+    except ImportError as exc:
+        return f"runtime unavailable: {exc}"
+    return None
+
+
+_SKIP = _check()
+pytestmark = pytest.mark.skipif(_SKIP is not None, reason=_SKIP or "")
+
+
+# ------------------------------------------------------------------ #
+# Fixture                                                             #
+# ------------------------------------------------------------------ #
+@pytest.fixture(scope="module")
+def pid():
+    from siwecal_common.edm4hep_pid import PidFileReader
+    return PidFileReader(EDM4HEP_FILE, n_layers=15)
+
+
+# ------------------------------------------------------------------ #
+# Schema tests                                                        #
+# ------------------------------------------------------------------ #
+SCALAR_VARS = [
+    "nhit", "zbary", "energy", "mip_likeness", "weighte",
+    "bar_x", "bar_y", "bar_r", "moliere", "transverse_rms",
+    "is_shower", "shower_start", "shower_max", "shower_end",
+    "shower_start_10", "shower_end_10", "shower_length",
+    "first_layer", "last_layer", "n_layers_hit", "e_over_nhit",
+    "shower_onset", "n_layers_before_onset", "fractal_dimension", "barxy_min_border_distance",
+]
+
+def test_event_count(pid):
+    """Every simulated event that survives the reco must be in the output.
+
+    Not a hardcoded count: how many events come out depends on the run mode.
+    EcalToEDM4hep drops masked channels and, in the default physics mode, hits
+    below 0.5 MIP; an event left with no hits is then dropped by the total-energy
+    filter. ``--validation`` disables the hit cut, so both counts are accepted
+    and the failure message says which mode was expected.
+    """
+    import uproot
+    tree = uproot.open(ECAL_TREE_FILE)["ecal"]
+    energy = tree["hit_energy"].array(library="np")
+    masked = tree["hit_ismasked"].array(library="np")
+    alive = [(np.asarray(m) == 0) for m in masked]
+    n_validation = sum(1 for a in alive if a.any())
+    n_physics = sum(1 for a, e in zip(alive, energy)
+                    if (a & (np.asarray(e) >= 0.5)).any())
+    assert pid.n_events in (n_physics, n_validation), (
+        f"got {pid.n_events} events; expected {n_physics} (physics mode, "
+        f"hit cut 0.5 MIP) or {n_validation} (--validation, no hit cut) "
+        f"out of {tree.num_entries} simulated")
+
+
+@pytest.mark.parametrize("var", SCALAR_VARS)
+def test_scalar_variable_present(pid, var):
+    assert var in pid.shape_names, f"'{var}' missing from shape_names"
+
+
+@pytest.mark.parametrize("kind", ["hits", "energy", "weighte"])
+def test_per_layer_profiles_present(pid, kind):
+    for layer in range(15):
+        name = f"{kind}_per_layer_{layer}"
+        assert name in pid.shape_names, f"'{name}' missing"
+
+
+# ------------------------------------------------------------------ #
+# Physical plausibility tests (5 GeV muons)                          #
+# ------------------------------------------------------------------ #
+
+def test_nhit_per_event(pid):
+    """5 GeV muons: expect ~15 hits (one per active layer). Allow a few delta rays."""
+    vals = np.array(pid.scalar("nhit"))
+    assert np.median(vals) == pytest.approx(15, abs=2), \
+        f"median nhit={np.median(vals):.1f} (expected ~15 for muons)"
+    assert np.all(vals >= 1), "event with 0 hits found"
+
+
+def test_energy_range(pid):
+    """Total energy of a through-going muon, in MIP units.
+
+    Not "15 MIP because 15 layers x 1 MIP": a MIP unit is the *most probable*
+    single-layer deposit, and the sum of fifteen Landau-distributed deposits has
+    a median well above fifteen, because the Landau mean sits above its MPV.
+    Measured on the reference sample with the per-layer MPV taken from the
+    simulation itself, the median total is 20.6 MIP.
+
+    The window is deliberately wide on the high side. The digitizer's MIPValues
+    in job3_digitize.py are ~12% below the MPV this geometry actually produces,
+    and 45% below it in layer 14 (the 650 um wafer), which inflates the observed
+    median to ~22.6. Fixing that calibration is a separate change; this test must
+    pass both before and after it, so it brackets a through-going muon rather
+    than pinning today's number.
+    """
+    vals = np.array(pid.scalar("energy"))
+    median = float(np.median(vals))
+    assert 15.0 <= median <= 30.0, \
+        f"median energy={median:.2f} MIP, outside the range a through-going muon can give"
+    assert np.all(vals > 0), "non-positive total energy found"
+
+
+def test_zbary_centered(pid):
+    """zbary = energy-weighted mean layer.  For uniform muon tracks it should
+    be close to the detector centre (layer ≈ 7 out of 0-14)."""
+    vals = np.array(pid.scalar("zbary"))
+    # Filter out edge cases (very few hits): require nhit>=10
+    nhit = np.array(pid.scalar("nhit"))
+    good = vals[nhit >= 10]
+    assert np.mean(good) == pytest.approx(7, abs=2), \
+        f"mean zbary={np.mean(good):.2f} (expected ~7 for through-going muons)"
+
+
+def test_mip_likeness_high(pid):
+    """Muons are MIPs: mip_likeness should be close to 1.0 for the vast majority."""
+    vals = np.array(pid.scalar("mip_likeness"))
+    assert np.median(vals) > 0.90, \
+        f"median mip_likeness={np.median(vals):.3f} (expected >0.90 for muons)"
+
+
+def test_not_shower(pid):
+    """5 GeV muons must not be classified as showers."""
+    is_shower = np.array(pid.scalar("is_shower"))
+    shower_fraction = np.mean(is_shower)
+    assert shower_fraction < 0.10, \
+        f"shower fraction={shower_fraction:.2%} too high for muons (expected <10%)"
+
+
+def test_shower_onset_defined_whenever_flagged(pid):
+    """The onset is what sets is_shower, so it must exist wherever the flag is.
+
+    This is the structural guarantee the onset criterion buys over the old
+    ascending-pairs one: shower_start can be NaN on a flagged event (it only
+    searches before the profile maximum), shower_onset cannot.
+    """
+    flag  = np.array(pid.scalar("is_shower"))
+    onset = np.array(pid.scalar("shower_onset"))
+    before = np.array(pid.scalar("n_layers_before_onset"))
+    flagged = flag > 0
+    if not flagged.any():
+        pytest.skip("no shower in this sample")
+    assert np.all(np.isfinite(onset[flagged])), \
+        "is_shower set on an event with no shower_onset"
+    assert np.all(np.isfinite(before[flagged]))
+    assert np.all(before[flagged] <= onset[flagged]), \
+        "more hit layers before the onset than there are layers before it"
+    assert np.all(np.isnan(onset[~flagged])), \
+        "shower_onset set on a non-shower event"
+
+
+def test_n_layers_hit(pid):
+    """Muons traverse the full detector: most events should hit all 15 layers."""
+    vals = np.array(pid.scalar("n_layers_hit"))
+    assert np.median(vals) == pytest.approx(15, abs=1), \
+        f"median n_layers_hit={np.median(vals):.1f} (expected 15 for muons)"
+
+
+def test_hits_per_layer_uniform(pid):
+    """For muons, hits should be approximately uniform across all 15 layers."""
+    layer_totals = np.array([
+        np.sum(pid.scalar(f"hits_per_layer_{l}")) for l in range(15)
+    ])
+    # Maximum layer should not be more than 3× the minimum (rough uniformity check)
+    ratio = layer_totals.max() / max(layer_totals.min(), 1)
+    assert ratio < 5, \
+        f"Hit distribution very non-uniform: max/min = {ratio:.1f}"
+
+
+# ------------------------------------------------------------------ #
+# valtree format test                                                 #
+# ------------------------------------------------------------------ #
+
+def test_valtree_file_exists():
+    assert os.path.exists(VALTREE_FILE), \
+        f"valtree output not found: {VALTREE_FILE}"
+
+
+def test_valtree_has_scalar_branches():
+    import ROOT
+    ROOT.gROOT.SetBatch(True)
+    f = ROOT.TFile(VALTREE_FILE, "READ")
+    t = f.Get("ecal")
+    assert t is not None, "TTree 'ecal' not found in valtree file"
+    for var in ["nhit", "energy", "mip_likeness", "is_shower", "zbary"]:
+        assert t.GetBranch(var) is not None, f"'{var}' branch missing from valtree"
+    f.Close()

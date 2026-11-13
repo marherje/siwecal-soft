@@ -1,0 +1,73 @@
+#!/bin/bash
+# One beam sample through the analysis chain: ddsim edm4hep -> digitised (real, reconstructed with the th210 table)
+# and undigitised (simple) ecal trees -> ECalPid edm4hep (hit MIP cut 0.5).
+#
+#   bash simulation/campaign/run_sim_chain.sh <E_GeV> <x_mm> <y_mm> <set: th210|th220|th230> [<out_base>]
+#   (also writes the valtree next to each PID file; condor: simulation/campaign/submit_sim_chain.sh)
+#
+# Input : Simulation/Generated/output_beam_e-_<E>GeV_xy_<x>_<y>_sigx13.75_sigy8.25_sigE0.02_beamline_real_w1924_mat_emz.edm4hep.root
+# Output: <out_base>/trees/ecal_<set>_e<E>_<x>_<y>{,_simple}.root
+#         <out_base>/pid/<set>_e<E>_<x>_<y>_{digi,nodigi}/*.edm4hep.root
+# out_base defaults to Simulation/Processed/adc_vs_tb/final_v5.
+#
+# Environment:
+#   DIGI_CALIB_DIR   MuonCalib-style table tree for the digitiser (default: the official EOS Calib/MuonCalib)
+#   RECO_TABLE       table that reconstructs the simulated ADC (default th210, like Reconstruction)
+#   DDSIM_SUFFIX     suffix of a ddsim variant after _w1924_mat_emz (e.g. _chipair, _rc0.1); use with <out_base>
+#   WORK             scratch dir (default ${TMPDIR:-/tmp}/sim_chain_$USER)
+#   PED_NOISE        1 (default): per-cell noise and true gain spread in the digitiser; 0 = the scalar noise
+#   FORCE=1          redo steps whose output exists; FORCE_DIGI=1 redoes only the digitised (real) branch
+# Rewritten from final_v3's chain_pos.sh + digi_recoth210.sh.
+E=${1:?energy}; X=${2:?x}; Y=${3:?y}; SET=${4:?set}
+R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+B=/eos/experiment/drdcalo/siw-ecal/TB2026-06/Simulation
+O=${5:-$B/Processed/adc_vs_tb/final_v5}
+export DIGI_CALIB_DIR=${DIGI_CALIB_DIR:-/eos/experiment/drdcalo/siw-ecal/TB2026-06/Calib/MuonCalib}
+RECO_TABLE=${RECO_TABLE:-th210}
+# per-cell electronic noise from the fixed pedestal tables + gain spread without fit error (job3_digitize.py)
+export PED_NOISE=${PED_NOISE:-1}
+in=$B/Generated/output_beam_e-_${E}GeV_xy_${X}_${Y}_sigx13.75_sigy8.25_sigE0.02_beamline_real_w1924_mat_emz${DDSIM_SUFFIX:-}.edm4hep.root
+tag=${SET}_e${E}_${X}_${Y}
+W=${WORK:-${TMPDIR:-/tmp}/sim_chain_$USER}/$tag
+
+# key4hep before any `set -u` (it would leave k4run off the PATH), then the repo's own components.
+source "$R/init_siwecalsoft.sh" --no-venv --quiet
+command -v k4run >/dev/null || { echo "k4run not on PATH" >&2; exit 1; }
+set -o pipefail
+export LD_LIBRARY_PATH=$R/install/lib64:$R/install/lib:$LD_LIBRARY_PATH
+export PYTHONPATH=$R/install/lib64:$R/install/lib:$R/install/python:$PYTHONPATH
+
+[ -s "$in" ] || { echo "missing ddsim input $in" >&2; exit 1; }
+[ -d "$DIGI_CALIB_DIR/mips/$RECO_TABLE" ] || { echo "no $RECO_TABLE table in $DIGI_CALIB_DIR" >&2; exit 1; }
+# plain mkdir per level: mkdir -p walks up into EOS parents it cannot touch
+for d in "$O" "$O/trees" "$O/pid" "$O/pid/${tag}_digi" "$O/pid/${tag}_nodigi"; do [ -d "$d" ] || mkdir "$d"; done
+mkdir -p "$W"
+
+for mode in real simple; do
+  if [ $mode = simple ]; then
+    out=$O/trees/ecal_${tag}_simple.root; pid=$O/pid/${tag}_nodigi; reco=""
+  else
+    out=$O/trees/ecal_${tag}.root; pid=$O/pid/${tag}_digi; reco=$RECO_TABLE
+  fi
+  redo=${FORCE:-0}; [ $mode = real ] && [ "${FORCE_DIGI:-0}" = 1 ] && redo=1
+  if [ "$redo" = 1 ] || [ ! -s "$out" ]; then
+    # the ecal tree is written by EcalTreeWriter in the same k4run (ECAL_TREE_OUTPUT)
+    (cd "$W" && CALIB_THRESHOLD=$SET DIGI_MODE=$mode RECO_TABLE_THRESHOLD=$reco INPUT_FILE=$in \
+      ECAL_TREE_OUTPUT=ecal.root k4run "$R/simulation/jobs/job3_digitize.py" > "$W/job3_$mode.log" 2>&1) \
+      || { echo "job3 FAILED $tag $mode"; tail -5 "$W/job3_$mode.log"; exit 1; }
+    cp "$W/ecal.root" "$out" && rm -f "$W/digitized.edm4hep.root" "$W/ecal.root"
+  fi
+  if [ "$redo" = 1 ] || ! ls "$pid"/*.edm4hep.root >/dev/null 2>&1; then
+    (cd "$R" && \
+      python3 reconstruction/jobs/run_pid_batch.py --file "$out" --outdir "$W/pid_$mode" --format both --hit-mip-cut 0.5 \
+      > "$W/pid_$mode.log" 2>&1) || { echo "pid FAILED $tag $mode"; tail -5 "$W/pid_$mode.log"; exit 1; }
+    cp "$W/pid_$mode"/*.edm4hep.root "$W/pid_$mode"/*.valtree.root "$pid"/
+  fi
+  # valtree next to the PID file (reconstruction/jobs/pid_to_valtree.py skips an existing one)
+  # The PID job above writes the valtree too; this only fills in the PID files of older runs that have none.
+  (cd "$R" && \
+    python3 reconstruction/jobs/pid_to_valtree.py "$pid"/*.edm4hep.root > "$W/valtree_$mode.log" 2>&1) \
+    || { echo "valtree FAILED $tag $mode"; tail -5 "$W/valtree_$mode.log"; exit 1; }
+done
+rm -rf "$W"
+echo "DONE $tag"
