@@ -4,6 +4,7 @@ title: "siwecal-soft: SiW-ECAL TB2026 data conversion, simulation and analysis s
 version: 1.0.0
 date-released: 2026-11-13
 repository-code: "https://github.com/marherje/siwecal-soft"
+doi: 10.5281/zenodo.24204938   # concept DOI: every version; v1.0.0 is 10.5281/zenodo.24204939
 type: software
 license: Apache-2.0
 authors:

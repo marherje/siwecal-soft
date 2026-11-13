@@ -1,5 +1,7 @@
 # siwecal-soft
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24204938.svg)](https://doi.org/10.5281/zenodo.24204938)
+
 Software of the SiW-ECAL TB2026 test beam: data conversion, simulation, the reconstruction both share, and the
 analysis that compares them. One repository, one CMake build, one install, one environment script, on Key4hep.
 
