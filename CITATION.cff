@@ -9,4 +9,6 @@ authors:
     given-names: "Jesus Pedro"
   - family-names: "Arquero Peinazo"
     given-names: "Olmo"
+  - family-names: "Shi"
+    given-names: "Yukun"
 keywords: [calorimetry, SiW-ECAL, test beam, Key4hep, Gaudi, DD4hep]
