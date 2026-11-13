@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "siwecal-soft: SiW-ECAL TB2026 data conversion, simulation and analysis software"
-version: 0.1.0
+version: 1.0.0
 date-released: 2026-11-13
 repository-code: "https://github.com/marherje/siwecal-soft"
 type: software
