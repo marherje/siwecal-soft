@@ -55,7 +55,8 @@ both        ecal tree --(reconstruction: EcalToEDM4hep + EcalShowerVariables + E
 | campaign | how to produce it |
 |---|---|
 | data | `data_conversion/jobs/condor/generate_reco_dag.py` |
-| simulation | `simulation/campaign/make_sim_dag.py --campaign <name> [--submit]` (one DAG: chunks, then groups) |
+| simulation, per data run (final_v10 on) | `simulation/campaign/make_run_sim_dag.py --campaign <name> [--submit]` (per run: dummy pass tunes the gun to the run's beam, then production with its statistics; see `simulation/run/README.md`) |
+| simulation, beam points (up to final_v9, muons, background) | `simulation/campaign/make_sim_dag.py --campaign <name> [--submit]` (one DAG: chunks, then groups) |
 
 ## Tests
 

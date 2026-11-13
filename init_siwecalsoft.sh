@@ -54,6 +54,8 @@ done
 for _d in "${SIWECAL_PREFIX}/lib" "${SIWECAL_PREFIX}/lib64"; do
     [ -d "$_d" ] && _sws_prepend LD_LIBRARY_PATH "$_d"
 done
+# the repo's executables (siwecal_beamspot)
+[ -d "${SIWECAL_PREFIX}/bin" ] && _sws_prepend PATH "${SIWECAL_PREFIX}/bin"
 # DD4hep finds the SiPadDetector plugin (lib*.components) through LD_LIBRARY_PATH; ROOT needs the rootmap path too.
 [ -d "${SIWECAL_PREFIX}/lib" ] && _sws_prepend ROOT_LIBRARY_PATH "${SIWECAL_PREFIX}/lib"
 

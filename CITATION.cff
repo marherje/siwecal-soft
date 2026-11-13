@@ -1,14 +1,22 @@
-# DRAFT: complete affiliations and ORCIDs before the first release (Zenodo reads this file).
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "siwecal-soft: SiW-ECAL TB2026 data conversion, simulation and analysis software"
+version: 0.1.0
+date-released: 2026-11-13
+repository-code: "https://github.com/marherje/siwecal-soft"
 type: software
 license: Apache-2.0
 authors:
   - family-names: "Marquez Hernandez"
     given-names: "Jesus Pedro"
+    affiliation: "IJCLab"
+    orcid: "https://orcid.org/0000-0001-8677-9905"
   - family-names: "Arquero Peinazo"
     given-names: "Olmo"
+    affiliation: "CIEMAT"
+    orcid: "https://orcid.org/0009-0006-7672-6352"
   - family-names: "Shi"
     given-names: "Yukun"
+    affiliation: "LLR"
+    orcid: "https://orcid.org/0000-0001-5587-8409"
 keywords: [calorimetry, SiW-ECAL, test beam, Key4hep, Gaudi, DD4hep]
