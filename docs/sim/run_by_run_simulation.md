@@ -1,6 +1,6 @@
-# Run-by-run simulation campaign (final_v10): design
+# Run-by-run simulation (final_v10 on)
 
-Status: approved 2026-11-13 (approach C and naming option 1 chosen by the user).
+Design of the simulation campaigns made per data run (2026-11-13). How to run them: `simulation/run/README.md`.
 
 ## Intent
 
@@ -27,11 +27,11 @@ per-run tuning pass done **with the production geometry** removes that bias by c
 - No change to the physics models (geometry, physics list, digitisation, sigma_E = 2 %).
 - No iteration to convergence: one tuning step, then a closure check that is reported, not acted on automatically.
 - Muon and background campaigns (`muon_points.txt`, `bkg_points.txt`) stay as they are.
-- Angle-scan runs and extremely short runs (`--min-events`, default 5000 data events: runs 69, 67, 70, 68) are left out (user request).
+- Angle-scan runs and extremely short runs (`--min-events`, default 5000 data events: runs 69, 67, 70, 68) are left out.
 
 ## Anti-goals
 
-- Anything that runs heavy work on the login node or submits without the user's confirmation.
+- Anything that runs heavy work on the login node or submits a campaign without review of its DAG.
 - Writing into an existing campaign directory or anywhere on EOS outside the new campaign folder.
 
 ## Approaches considered
@@ -40,7 +40,7 @@ per-run tuning pass done **with the production geometry** removes that bias by c
 |---|---|---|
 | A | quadrature formula per run against the existing −2.65 m reference | simplest; inherits the v9 bias |
 | B | one reference sample per energy with the H2 line, then the formula per run | cheap, fixes the bias on average; assumes the line's widening is the same for every run at one energy |
-| **C (chosen by the user)** | **per run: dummy simulation with an initial guess, measure, correct, then production** | most direct; one extra short sim + one extra measurement node per run |
+| **C (adopted)** | **per run: dummy simulation with an initial guess, measure, correct, then production** | most direct; one extra short sim + one extra measurement node per run |
 
 ## Design
 
@@ -52,7 +52,7 @@ Generated once by a small tool from `beam_points.txt` (its runs column, with the
 point; 103 electron runs), then maintained by hand. The 6 other runs of `Reconstruction/` are not electrons runs
 of the scans and are left out unless added.
 
-### Code split (user decision, 2026-11-13)
+### Code split
 
 Every computation on events runs in C++; Python and bash only configure and orchestrate.
 - C++: `common/include/siwecal/BeamSpot.h` (selection, centre, width, tuning, closure) and the executable
@@ -105,7 +105,7 @@ Dummy: 3000 events (one node, no chunking).
 
 ### Output on EOS: `Simulation/Processed/final_v10/`
 
-Naming (chosen by the user): one folder per run named exactly like its data folder in `Reconstruction/`, files
+Naming: one folder per run named exactly like its data folder in `Reconstruction/`, files
 named like the data files with `sim_` after the `ecal_` prefix, and `_nodigi` for the undigitised variant:
 
     final_v10/<RUN>/ecal_sim_<RUN>.root                      ecal tree, digitised (the one compared with data)
@@ -121,18 +121,19 @@ format with the tuned gun) so `FINAL_GROUPS=.../beam_points_v10.txt python analy
 
 ## Constraints
 
-- Login node: only DAG writing and dry runs. Every `condor_submit` is confirmed by the user.
-- EOS: only the new `final_v10/` tree; plain `mkdir` per level.
+- Login node: only DAG writing and dry runs; the campaign runs on HTCondor.
+- EOS: only the campaign's own tree; plain `mkdir` per level.
 - Key4hep via `init_siwecalsoft.sh`; no `set -u` in job scripts.
+- While a campaign runs, do not rebuild or switch branches in the repo: the jobs read its scripts and `install/`.
 
-## Testing
+## Tests
 
-- C++ tests (ctest): `BeamSpot.h` on synthetic data (Gaussian, shower-like cut, NaN, empty, tuning floor, closure
-  flags) and `siwecal_beamspot` end to end on a small generated valtree.
-- DAG writing: `--dry-run` test that writes the DAG for 2 runs into a tmp dir and checks node graph + params.
-- Small real test (with confirmation): one run, dummy 500 + production 2 × 500, campaign `test_v10` under
-  `Simulation/tests/run_by_run/`, then the user decides on final_v10.
+- ctest: `beam_spot` (`BeamSpot.h` on synthetic data: Gaussian, shower-like cut, NaN, empty, tuning floor, closure
+  flags) and `beamspot_exe` (`siwecal_beamspot` end to end, checked against the numpy definition of
+  `analysis/beam_spread.py`).
+- pytest `tests/control/`: `test_run_list.py` (run list vs `beam_points.txt`, no angle-scan runs),
+  `test_run_sim_dag.py` (DAG graph, data parameters, skipped runs, DONE detection), `test_campaign_summary.py`.
 
-## Left to the builder
+## final_v10
 
-File and function names beyond those above, closure thresholds, log/retry settings, exact wrapper interface.
+Launched 2026-11-13: 99 runs (67, 68, 69, 70 skipped as too short), 7.88 M shower-like events → 3990 chunks of 2000.

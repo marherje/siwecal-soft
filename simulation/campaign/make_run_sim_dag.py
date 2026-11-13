@@ -2,7 +2,7 @@
 """Write (and with --submit, submit) the HTCondor DAG of a run-by-run simulation campaign: one simulated sample per
 data run of the run list, with the beam and the statistics of that run.
 
-Per run (design: docs/superpowers/specs/2026-11-13-run-by-run-simulation-design.md):
+Per run (design: docs/sim/run_by_run_simulation.md):
   here   siwecal_beamspot measure on the data valtree (Reconstruction/<RUN>/ecal_<RUN>.valtree.root): shower-like
          centre, width and count -> params/<RUN>.data.json with the initial gun and the number of chunks
   d_RUN  run_sim_dummy.sh: short simulation with the initial gun, measured and tuned -> params/<RUN>.json

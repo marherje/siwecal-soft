@@ -23,7 +23,7 @@ The local `data/` subdirectory is no longer used and should not be created.
 ## Run-by-run campaigns (final_v10 on)
 
 One simulated sample per data run, with that run's beam and statistics
-(design: `docs/superpowers/specs/2026-11-13-run-by-run-simulation-design.md`).
+(design: `docs/sim/run_by_run_simulation.md`).
 
 ```bash
 source init_siwecalsoft.sh
