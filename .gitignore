@@ -5,6 +5,21 @@ install/
 work/
 condor_*/
 out_*/
+# everything the HTCondor launchers generate, wherever they are run from:
+#   DAGs and DAGMan's own files (.dag.condor.sub, .dagman.out/.log, .lib.out/.err, .nodes.log, .metrics, .lock, rescue DAGs),
+#   submit files (the few versioned templates are already tracked; a new one needs `git add -f`),
+#   steer/, log/ and macros/ of simulation/run/generic_condor_*.sh and launch_beam_final.sh,
+#   generated/ of data_conversion/jobs/condor/generate_*_dag.py, test geometries of simulation/geometry/colltest/
+*.dag
+*.dag.*
+*.rescue[0-9]*
+*.sub
+*.jdl
+steer/
+log/
+macros/
+generated/
+simulation/geometry/colltest/
 # environments and per-user settings
 .venv/
 settings.yml
