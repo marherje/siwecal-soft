@@ -102,6 +102,15 @@ Dummy: 3000 events (one node, no chunking).
   numbers collide, so the run number itself is not used.
 - Geometry/physics/digitiser exactly as `make_sim_dag.py` today (H2 compact, `BEAM_Z_MM=-65500`, QGSP_BERT_EMZ,
   `job3_digitize.py` defaults, reco with th210 table).
+- Optional far collimator, per beam energy: `--far-collimator 7.5=23` puts 1 m of iron jaws (square hole, half-side
+  23 mm, centred on the run's data spot) at -26 m (`--far-collimator-z`) in the runs at 7.5 GeV only; the runs of
+  any other energy keep the free line. Each collimated run gets its own compact,
+  `simulation/geometry/generated/<campaign>/<RUN>.xml` (git-ignored), passed to its dummy and chunks as
+  `COMPACT_FILE`; `params/<RUN>.data.json` records `compact` and `far_collimator`. The jaws may not overlap any
+  element of the line (free slots: -26, -33.5, -42.5 m). Why per energy: the 7.5 GeV spot of the data has truncated
+  tails that the free line does not give, the 20 and 74 GeV spots do not, and in H2 the collimators were set run by
+  run (collimator tests, 2026-11). The tune assumes widths add in quadrature, which a cut breaks: check the closure of
+  the collimated runs (two dummy passes may be needed).
 
 ### Output on EOS: `Simulation/Processed/final_v10/`
 
