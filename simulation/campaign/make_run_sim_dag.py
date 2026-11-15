@@ -15,6 +15,8 @@ Per run (design: docs/sim/run_by_run_simulation.md):
     python3 simulation/campaign/make_run_sim_dag.py --campaign final_v10 --submit    # ... and condor_submit_dag
     python3 simulation/campaign/make_run_sim_dag.py --campaign test_v10 --out <dir> --only <RUN> \\
         --dummy-events 500 --max-events 1000 --chunk-events 500                      # small test
+    python3 simulation/campaign/make_run_sim_dag.py --campaign final_v11 --far-collimator 7.5=23
+        # iron collimator 26 m upstream, half-aperture 23 mm, only in the 7.5 GeV runs (see collimator.py)
 
 Runs shorter than --min-events (default 5000 events in the data valtree) are skipped. Without --submit nothing
 is written on EOS: the data parameters go to <dag-dir>/params/ and are copied to
@@ -31,6 +33,7 @@ import sys
 from siwecal_common import paths
 from make_run_list import read_runs
 from make_sim_dag import eos_mkdir
+import collimator
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -86,8 +89,17 @@ def main():
     ap.add_argument("--sigma-e", default="0.02")
     ap.add_argument("--compact", default="SND_compact_beamline.xml")
     ap.add_argument("--beam-z", type=float, default=-65500.0)
+    ap.add_argument("--far-collimator", default="",
+                    help="half-aperture [mm] per beam energy of an iron collimator in the far line, e.g. 7.5=23 "
+                         "(runs of any other energy: none); default: no collimator")
+    ap.add_argument("--far-collimator-z", type=float, default=-26000.0, help="its centre [mm from the box front]")
+    ap.add_argument("--far-collimator-length", type=float, default=1000.0, help="its length along the beam [mm]")
     ap.add_argument("--submit", action="store_true")
     args = ap.parse_args()
+    try:
+        coll = collimator.parse_spec(args.far_collimator)
+    except ValueError as e:
+        ap.error(str(e))
 
     out = args.out or os.path.join(SIM, "Processed", args.campaign)
     dag_dir = os.path.abspath(args.dag_dir or os.path.join(REPO, "work", f"condor_{args.campaign}"))
@@ -97,7 +109,7 @@ def main():
     runs = read_runs(args.runs)
     only = set(args.only.split(",")) if args.only else None
 
-    env = (f"COMPACT_FILE={args.compact} BEAM_Z_MM={args.beam_z:g} PHYSICS_LIST=QGSP_BERT_EMZ RECO_TABLE=th210 "
+    env = (f"COMPACT_FILE=$(COMPACT) BEAM_Z_MM={args.beam_z:g} PHYSICS_LIST=QGSP_BERT_EMZ RECO_TABLE=th210 "
            f"SIGMA_E={args.sigma_e}")
     sub = {k: os.path.join(dag_dir, f"{k}.sub") for k in ("dummy", "chunk", "group", "summary")}
     write_sub(sub["dummy"], f"{HERE}/run_sim_dummy.sh", f"{REPO} {out} $(RUN) $(SEED) {args.dummy_events}", env,
@@ -130,8 +142,14 @@ def main():
         if args.max_events:
             n_events = min(n_events, args.max_events)
         n_chunks = -(-n_events // ch)
+        compact, a, far = args.compact, collimator.aperture(coll, r["E"]), None
+        if a is not None:   # the jaws are centred on the data spot of the run
+            compact = collimator.write_compact(args.compact, f"generated/{args.campaign}/{run}.xml", spot["x"],
+                                               spot["y"], a, args.far_collimator_z, args.far_collimator_length)
+            far = {"a": a, "z": args.far_collimator_z, "length": args.far_collimator_length}
         params = dict(r, data=spot, n_events=n_events, n_chunks=n_chunks, chunk_events=ch,
-                      gun0={"x": spot["x"], "y": spot["y"], "sx": max(spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)})
+                      gun0={"x": spot["x"], "y": spot["y"], "sx": max(spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)},
+                      compact=compact, far_collimator=far)
         json.dump(params, open(os.path.join(dag_dir, "params", f"{run}.data.json"), "w"), indent=2)
         made.append(run)
 
@@ -139,7 +157,8 @@ def main():
         group_done = all(os.path.exists(os.path.join(out, run, f"ecal_sim_{run}{s}.valtree.root")) for s in ("", "_nodigi"))
         dummy_done = group_done or os.path.exists(os.path.join(out, "params", f"{run}.json"))
         lines += [f"JOB d_{run} {sub['dummy']}" + (" DONE" if dummy_done else ""),
-                  f'VARS d_{run} RUN="{run}" SEED="{args.seed_offset + i * 1000 + 999}" FLAVOUR="{flavour}"',
+                  f'VARS d_{run} RUN="{run}" SEED="{args.seed_offset + i * 1000 + 999}" FLAVOUR="{flavour}" '
+                 f'COMPACT="{compact}"',
                   f"RETRY d_{run} 2"]
         chunks = []
         for k in range(n_chunks):
@@ -148,7 +167,7 @@ def main():
             done = group_done or (os.path.exists(remote + ".root") and os.path.exists(remote + "_simple.root"))
             lines += [f"JOB {node} {sub['chunk']}" + (" DONE" if done else ""),
                       f'VARS {node} RUN="{run}" K="{k}" SEED="{args.seed_offset + i * 1000 + k}" CH="{ch}" '
-                      f'NAME="{node}" FLAVOUR="{flavour}"',
+                      f'NAME="{node}" FLAVOUR="{flavour}" COMPACT="{compact}"',
                       f"RETRY {node} 2"]
             chunks.append(node)
         lines += [f"JOB g_{run} {sub['group']}" + (" DONE" if group_done else ""),
@@ -156,7 +175,8 @@ def main():
                   f"PARENT d_{run} CHILD {' '.join(chunks)}", f"PARENT {' '.join(chunks)} CHILD g_{run}"]
         groups.append(f"g_{run}")
         print(f"{run:<30} {r['E']:>4} GeV  data ({spot['x']:6.1f},{spot['y']:6.1f}) mm  width {spot['wx']:5.1f} x "
-              f"{spot['wy']:5.1f} mm  {spot['n']:>6} showers -> {n_chunks} x {ch}{'  [done]' if group_done else ''}")
+              f"{spot['wy']:5.1f} mm  {spot['n']:>6} showers -> {n_chunks} x {ch}"
+              f"{f'  far collimator a {a:g} mm' if a is not None else ''}{'  [done]' if group_done else ''}")
     if groups:
         lines += ["JOB summary " + sub["summary"], f"PARENT {' '.join(groups)} CHILD summary"]
     dag = os.path.join(dag_dir, f"{args.campaign}.dag")
