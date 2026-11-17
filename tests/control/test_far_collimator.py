@@ -137,7 +137,8 @@ def test_dag_collimates_only_the_listed_energy(runs):
     assert "far collimator a 23 mm" in out
     pa = json.load(open(tmp / "dag" / "params" / f"{A}.data.json"))
     pb = json.load(open(tmp / "dag" / "params" / f"{B}.data.json"))
-    assert pa["far_collimator"] == {"a": 23.0, "z": -26000.0, "length": 1000.0} and pa["compact"] == gen
+    assert pa["far_collimator"] == {"a": 23.0, "z": -26000.0, "length": 1000.0, "transmission": 0.4}
+    assert pa["compact"] == gen
     assert pb["far_collimator"] is None and pb["compact"] == BASE
     # centred on the run's data spot
     left = next(d for d in ET.parse(os.path.join(GEO, gen)).getroot().iter("detector")
@@ -145,6 +146,30 @@ def test_dag_collimates_only_the_listed_energy(runs):
     assert left.find("position").get("x") == f"{pa['data']['x'] - 23.0 - collimator.JAW_W / 2:.4f}*mm"
     for sub in ("dummy", "chunk"):
         assert "COMPACT_FILE=$(COMPACT)" in (tmp / "dag" / f"{sub}.sub").read_text()
+
+
+def test_collimated_runs_simulate_more(runs):
+    """The jaws stop part of the beam: n_data / transmission events and the larger dummy, only where they stand."""
+    tmp, _, _ = runs
+    _, dag = _dag(runs, "--far-collimator", "7.5=23", "--far-collimator-transmission", "0.4")
+    pa = json.load(open(tmp / "dag" / "params" / f"{A}.data.json"))
+    pb = json.load(open(tmp / "dag" / "params" / f"{B}.data.json"))
+    assert pa["data"]["n"] == pb["data"]["n"] == 3000
+    assert (pa["n_events"], pa["n_chunks"], pa["dummy_events"]) == (8000, 4, 6000)   # 3000 / 0.4 = 7500 -> 4 x 2000
+    assert (pb["n_events"], pb["n_chunks"], pb["dummy_events"]) == (4000, 2, 3000)
+    assert pa["far_collimator"]["transmission"] == 0.4
+    assert f"c_{A}_003" in dag and f"c_{B}_002" not in dag
+    assert re.search(rf'^VARS d_{A} .*NDUMMY="6000"', dag, re.M) and re.search(rf'^VARS d_{B} .*NDUMMY="3000"', dag,
+                                                                                  re.M)
+    assert "$(NDUMMY)" in (tmp / "dag" / "dummy.sub").read_text()
+
+
+def test_bad_transmission_is_refused(runs):
+    tmp, camp, env = runs
+    r = subprocess.run(["python3", os.path.join(ROOT, "simulation/campaign/make_run_sim_dag.py"), "--campaign", camp,
+                        "--runs", str(tmp / "runs.txt"), "--dag-dir", str(tmp / "dag"), "--far-collimator", "7.5=23",
+                        "--far-collimator-transmission", "0"], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "transmission" in r.stderr
 
 
 def test_dag_without_collimator_is_unchanged(runs):
