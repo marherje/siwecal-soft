@@ -110,7 +110,24 @@ Dummy: 3000 events (one node, no chunking).
   element of the line (free slots: -26, -33.5, -42.5 m). Why per energy: the 7.5 GeV spot of the data has truncated
   tails that the free line does not give, the 20 and 74 GeV spots do not, and in H2 the collimators were set run by
   run (collimator tests, 2026-11). The tune assumes widths add in quadrature, which a cut breaks: check the closure of
-  the collimated runs (two dummy passes may be needed).
+  the collimated runs (two dummy passes may be needed). The jaws stop part of the beam (shower-like fraction 0.40-0.44
+  at 7.5 GeV with a = 25 mm, 0.92 without), so a collimated run simulates `n / --far-collimator-transmission`
+  events (default 0.4) to match the statistics of the data, and its dummy has `--far-collimator-dummy-events`
+  (default 6000) instead of 3000; both are recorded in `params/<RUN>.data.json`.
+- Rectangular far collimator per run and per axis, `--rect-collimator 7.5,10` (used by final_v11). A fixed square hole
+  leaves the spot too wide in y and too narrow in x (in H2 the horizontal and vertical collimators are independent),
+  so for the runs of those energies the apertures are found at run time, per axis:
+  `d1` free-line dummy (`collimator/pass1/`) → `p2` (`collimator_prep.py step2`): jaws on an axis only if the
+  free-line tune hits the floor (gun sigma < 0.35 × data width: the line alone is too wide) or the free line's tails
+  are wider than the data's by > 0.10, first half-aperture = data width / 0.88, gun sigma = data width; otherwise no
+  jaws and the tuned gun → `d2` dummy with the jaws (`collimator/pass2/`) → `p3` (`step3`): aperture + (w_data −
+  w_d2) / 0.45 (step ≤ 6 mm), writes `params/<RUN>.json` and the run's geometry
+  `simulation/geometry/generated/<campaign>/<RUN>.xml` (a run left open on both axes gets the base line) → chunks.
+  Decisions and tails per axis: `collimator/<RUN>{.step2,}.json`. Tails ((p95 − p5) / IQR of the barycentre) are
+  computed in Python in the node (uproot), not in `BeamSpot.h`: the C++ could not be rebuilt while final_v11 ran;
+  move them there later. Collimator tests (2026-11-16, 8 runs 7.5–74 GeV, `work/beam_collimator/make_rect.py`):
+  width within ±5 % of the data everywhere; jaws needed only at 7.5 and 10 GeV, mostly in y; shower shapes as with the
+  free line, except about −0.1σ in hits and energy for the run collimated on both axes (run 57).
 
 ### Output on EOS: `Simulation/Processed/final_v10/`
 
@@ -146,3 +163,13 @@ format with the tuned gun) so `FINAL_GROUPS=.../beam_points_v10.txt python analy
 ## final_v10
 
 Launched 2026-11-13: 99 runs (67, 68, 69, 70 skipped as too short), 7.88 M shower-like events → 3990 chunks of 2000.
+
+## final_v11
+
+Launched 2026-11-17 in two DAGs writing to the same `Simulation/Processed/final_v11/`:
+- `work/condor_final_v11/`: the 87 runs at 20 GeV and above (67, 68, 69, 70 skipped as too short), free line, as
+  final_v10 (the collimator tests left every axis open there); 3167 chunks. Launched from fd76286 plus uncommitted
+  changes that do not affect these runs (`launched_from.txt`, `uncommitted.diff` in that folder).
+- `work/condor_final_v11_low/`: the 12 runs at 7.5 and 10 GeV with `--rect-collimator 7.5,10` and
+  `--seed-offset 30000000` (no seed shared with the first DAG).
+The summary of the first DAG covers its 87 runs; run `campaign_summary.py` on the whole run list once both are done.
