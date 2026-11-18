@@ -17,7 +17,6 @@ A run whose two axes stay open gets a geometry identical to the base compact (no
 """
 import json
 import os
-import shutil
 import sys
 
 import uproot
@@ -34,10 +33,7 @@ def spot_tails(valtree):
 def write_geometry(base, rel, cx, cy, ax, ay, far, geo):
     if ax or ay:
         return collimator.write_compact(base, rel, cx, cy, ax, far["z"], far["length"], geo=geo, ay=ay)
-    path = os.path.join(geo, rel)   # both axes open: the base line, under the name the chunks expect
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    shutil.copy(os.path.join(geo, base), path)
-    return rel
+    return collimator.write_open(base, rel, geo)   # both axes open: the base line, under the name the chunks expect
 
 
 def dump(obj, path):

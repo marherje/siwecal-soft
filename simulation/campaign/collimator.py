@@ -107,6 +107,20 @@ def jaws(cx, cy, z, ax, ay, length):
     return out
 
 
+def relocate(text, out_rel):
+    """A compact of the geometry folder written to <geometry>/<out_rel>, deeper: its includes point back up."""
+    depth = out_rel.count("/")
+    return re.sub(r'ref="([^"/]+\.xml)"', lambda m: f'ref="{"../" * depth}{m.group(1)}"', text)
+
+
+def write_open(base, out_rel, geo=GEO):
+    """The base line without jaws, under out_rel (a run whose two axes stay open); returns out_rel."""
+    path = os.path.join(geo, out_rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write(relocate(open(os.path.join(geo, base)).read(), out_rel))
+    return out_rel
+
+
 def write_compact(base, out_rel, cx, cy, a, z=-26000.0, length=1000.0, geo=GEO, ay=SQUARE):
     """Derive <geo>/<out_rel> from <geo>/<base> with the far collimator; returns out_rel (the COMPACT_FILE of the run).
     a is the half-aperture in x, and in y too unless ay is given (rectangular hole; None = that axis open).
@@ -120,8 +134,7 @@ def write_compact(base, out_rel, cx, cy, a, z=-26000.0, length=1000.0, geo=GEO, 
     hit = [n for n, a_lo, a_hi in line_extents(text) if a_lo < hi and lo < a_hi]
     if hit or hi >= 0:
         raise ValueError(f"far collimator {lo:g} .. {hi:g} mm overlaps {', '.join(hit) or 'the box'}")
-    depth = out_rel.count("/")   # the derived file sits deeper: its includes point back to the geometry folder
-    text = re.sub(r'ref="([^"/]+\.xml)"', lambda m: f'ref="{"../" * depth}{m.group(1)}"', text)
+    text = relocate(text, out_rel)
     fmt = lambda v: f"{v:.2f} mm" if v else "open"   # noqa: E731
     ap = f"{ax:g} mm" if ax == ay else f"x {fmt(ax)}, y {fmt(ay)}"
     note = (f"  <!-- far collimator (make_run_sim_dag.py, option far-collimator): iron, half-aperture {ap}, "

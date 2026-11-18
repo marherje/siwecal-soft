@@ -134,10 +134,29 @@ def test_prep_steps(tmp_path, geo, k4env):
 
 
 def test_prep_both_axes_open_keeps_the_line(tmp_path, geo, k4env):
+    """Both axes open: the base line, with its includes pointing back to the geometry folder (final_v11, runs 21,
+    25, 292: a verbatim copy one folder deeper could not find elements.xml)."""
     prep = _load("collimator_prep")
-    path = prep.write_geometry(BASE, "gen/open.xml", 0.0, 0.0, None, None, {"z": -26000.0, "length": 1000.0},
+    path = prep.write_geometry(BASE, "gen/c/open.xml", 0.0, 0.0, None, None, {"z": -26000.0, "length": 1000.0},
                                str(geo))
-    assert (geo / path).read_text() == (geo / BASE).read_text()
+    base = (geo / BASE).read_text()
+    assert (geo / path).read_text() == re.sub(r'ref="([^"/]+\.xml)"', r'ref="../../\1"', base)
+    assert not _jaws(geo / path)
+
+
+def test_dd4hep_builds_the_open_copy(k4env):
+    """The open copy loads in DD4hep from its real place, as the dummy and chunks load it."""
+    prep = _load("collimator_prep")
+    rel = f"generated/pytest_open_{os.getpid()}/RUN_pass2.xml"
+    try:
+        prep.write_geometry(BASE, rel, 0.0, 0.0, None, None, {"z": -26000.0, "length": 1000.0}, GEO)
+        code = ("import dd4hep, sys; d = dd4hep.Detector.getInstance(); d.fromXML(sys.argv[1]); "
+                "print(len(list(d.detectors())))")
+        r = subprocess.run(["python3", "-c", code, os.path.join(GEO, rel)], env=k4env, capture_output=True,
+                           text=True, timeout=300)
+        assert r.returncode == 0, r.stderr[-2000:]
+    finally:
+        shutil.rmtree(os.path.join(GEO, os.path.dirname(rel)), ignore_errors=True)
 
 
 A, B = "TB2026CERN_run_000022", "TB2026CERN_run_000023"
