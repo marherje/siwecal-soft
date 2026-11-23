@@ -37,6 +37,7 @@ for mode in real simple; do
       echo "ERROR: job3 $mode failed (exit $rc)"; tail -20 "$mode/job3.log"; exit 1
     fi
   fi
+  grep -m1 "occupancy baseline sag" "$mode/job3.log"   # the digitiser setting in the node's .out
   n=$(python3 -c "import uproot; print(uproot.open('$mode/ecal.root')['ecal'].num_entries)" 2>/dev/null)
   [ -n "$n" ] && [ "$n" -gt 0 ] || { echo "ERROR: empty ecal tree ($mode)"; exit 1; }
   rm -f "$mode/digitized.edm4hep.root"
