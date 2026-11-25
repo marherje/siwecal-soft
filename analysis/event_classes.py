@@ -21,7 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-from analysis.final_panels import RECO, load_groups, sim_valtree, showerlike  # noqa: E402
+from analysis.final_panels import RECO, load_groups, sim_valtrees, showerlike  # noqa: E402
 from analysis.compare_event_level import gauss_core  # noqa: E402
 
 INK, MUTED, GRID = "#1b2227", "#56626b", "#d7dde2"
@@ -93,7 +93,7 @@ def main():
     for ax, name in zip(axes[0], a.group):
         g = groups[name]
         d = load([f"{RECO}/{r}/ecal_{r}.valtree.root" for r in g["runs"]], acq=True)
-        s = load([sim_valtree(g, "digi")])
+        s = load(sim_valtrees(g, "digi"))
         cl = classes(d, s)
         lines.append(f"== {name}: {len(d['nhit_chan'])} data / {len(s['nhit_chan'])} sim shower-like events; "
                      "sim/data per class (Gaussian core for hits and energy, median otherwise)")

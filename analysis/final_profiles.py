@@ -59,6 +59,19 @@ def sim_tree(g, kind):
     return f"{SIM}/trees/ecal_{g['name']}{'_simple' if kind == 'nodigi' else ''}.root"
 
 
+def sim_files(g, kind):
+    """(ecal trees, valtrees) of the simulation of group g, paired file by file. Group campaigns: trees/ecal_<group>
+    {,_simple}.root and its valtree; run-by-run campaigns (final_v10 on): <RUN>/ecal_sim_<RUN>{,_nodigi}.root and
+    .valtree.root of each run of the group that has both."""
+    t = sim_tree(g, kind)
+    if os.path.exists(t):
+        return [t], [sim_valtree(g, kind)]
+    suf = "" if kind == "digi" else "_nodigi"
+    pairs = [(f"{SIM}/{r}/ecal_sim_{r}{suf}.root", f"{SIM}/{r}/ecal_sim_{r}{suf}.valtree.root") for r in g["runs"]]
+    pairs = [p for p in pairs if os.path.exists(p[0]) and os.path.exists(p[1])]
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
 def border_distance(tree_path, valtree_path, ids):
     """barxy_min_border_distance of the first len(ids['run']) events of tree_path, from its valtree. Both are in the
     same order, but run_pid_batch.py drops the events without hits, so the valtree is a subsequence of the tree: walk
@@ -133,7 +146,10 @@ def group_profiles(g, outdir, max_events, use_cache=True, border_cut=None):
     s["data"], x0 = layer_sums([f"{RECO_TREES}/{r}/ecal_{r}.root" for r in runs], max_events,
                                [f"{RECO}/{r}/ecal_{r}.valtree.root" for r in runs], border_cut)
     for kind in ("nodigi", "digi"):
-        s[kind], x0k = layer_sums([sim_tree(g, kind)], None, [sim_valtree(g, kind)], border_cut)
+        trees, vts = sim_files(g, kind)
+        if not trees:
+            raise FileNotFoundError(f"[{g['name']}] no {kind} simulation in {SIM}")
+        s[kind], x0k = layer_sums(trees, None, vts, border_cut)
         if not np.allclose(x0, x0k, equal_nan=True):
             print(f"[{g['name']}] WARNING: X0 per layer differs, data {x0} {kind} {x0k}")
     os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -228,12 +244,12 @@ def main(argv=None):
     ap.add_argument("--groups", default="th210_e20_26_-52,th210_e74_22_-49")
     ap.add_argument("--max-data-events", type=int, default=None)
     ap.add_argument("--no-cache", action="store_true")
-    ap.add_argument("--cal-file", default=None, help="mip_gev_line.txt of a final_panels.py pass without the cut")
+    ap.add_argument("--cal-file", default=None, help="mip_gev_line.txt of the final_panels.py pass with the same cut")
     ap.add_argument("--border-cut", type=float, default=None,
                     help="keep barxy_min_border_distance > MM among the shower-like events")
     a = ap.parse_args(argv)
     if a.border_cut is not None and not a.cal_file:
-        ap.error("--border-cut needs --cal-file: the MIP -> GeV line is fitted without the cut")
+        ap.error("--border-cut needs --cal-file: the MIP -> GeV line of the final_panels.py pass with the same cut")
     # slope of each group's own threshold-set line (final_panels.SET_LINES), else the th210 line
     os.makedirs(a.outdir, exist_ok=True)
     want = a.groups.split(",")

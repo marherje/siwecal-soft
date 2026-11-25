@@ -6,7 +6,7 @@ pedestals + MIP table for every run) against the simulation without and with dig
 One 3 x 5 panel per group (threshold set, beam energy, beam position); runs of the same group are pooled.
 
     python analysis/final_panels.py <outdir> [--groups th210_e20_26_-52,th230_E4_e20,...] [--no-cache]
-        [--border-cut MM --cal-file <nocut_outdir>/mip_gev_line.txt]
+        [--border-cut MM] [--cal-file <outdir>/mip_gev_line.txt]
 
 Writes <outdir>/panel_<group>.png, final_panels_summary.txt, resolution_vs_energy.png, mip_gev_line.txt (the fitted
 MIP -> GeV line), and a per-group cache (<outdir>/cache_<campaign>[_b<MM>]/<group>.npz) so re-plotting does not
@@ -14,14 +14,22 @@ re-read EOS.
 
 --border-cut MM keeps, among the shower-like events, those with barxy_min_border_distance > MM (the barycentre's
 distance to the nearest active edge, needs valtrees that carry it), and writes border_survival.txt. The p90 of the
-shower-like cut is still taken on the whole sample. The MIP -> GeV calibration applies to every event, so it is not
-refitted on the cut sample: --border-cut requires --cal-file, the mip_gev_line.txt of a pass without the cut.
+shower-like cut is still taken on the whole sample. The MIP -> GeV line is fitted on the same selection it is applied to
+(with --border-cut, on the cut scans): the th210 scan sits ~39 mm from the edge, so a line fitted without the cut carries
+the lateral leakage and puts the contained (cut) showers 2-5 % above the beam energy. --cal-file reads a line instead of
+fitting it (another pass's mip_gev_line.txt, e.g. for a subset of groups).
 
 Inputs (environment overrides, for tests on other campaigns):
     FINAL_RECO   data campaign        (default TB2026-06/Reconstruction)
     FINAL_SIM    simulation folder    (default .../Simulation/Processed/final_v7; trees/ and pid/ inside)
-The simulation of group <set>_e<E>_<pos> is pid/<set>_e<E>_<pos>_{digi,nodigi}/*.valtree.root; the data
-<run>/ecal_<run>.valtree.root.
+    FINAL_GROUPS groups file          (default simulation/campaign/beam_points.txt)
+The simulation of group <set>_e<E>_<pos> is pid/<set>_e<E>_<pos>_{digi,nodigi}/*.valtree.root (group campaigns,
+final_v5-v9) or, for a run-by-run campaign (final_v10 on), the samples of the group's runs pooled,
+<RUN>/ecal_sim_<RUN>{,_nodigi}.valtree.root; the data <run>/ecal_<run>.valtree.root. A run-by-run campaign is shown
+per group of beam_points.txt (default) or per run with FINAL_GROUPS=<campaign>/beam_points_v10.txt (one point per run,
+written by campaign_summary.py):
+
+    FINAL_SIM=.../Simulation/Processed/final_v11 python analysis/final_panels.py <outdir>
 
 Inputs are the valtrees (reconstruction/jobs/pid_to_valtree.py) of data and simulation: the PID stage's 0.5 MIP hit cut applies to
 every variable, identically in both. Selection: shower-like events, nhit > 0.5 x p90 of the sample. Calibrated energy: straight line sum_w [MIP] = a E + b
@@ -41,7 +49,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 from analysis.compare_event_level import gauss_core  # noqa: E402
-from siwecal_common import paths  # noqa: E402
+from siwecal_common import paths, plot_style  # noqa: E402
 
 B = "/eos/experiment/drdcalo/siw-ecal/TB2026-06"
 RECO = os.environ.get("FINAL_RECO", f"{B}/Reconstruction")
@@ -49,7 +57,12 @@ SIM = os.environ.get("FINAL_SIM", f"{B}/Simulation/Processed/final_v7")
 
 
 def _run(r):
-    return f"TB2026CERN_eudaq_run_{int(r[1:]):06d}" if str(r).startswith("e") else f"TB2026CERN_run_{int(r):06d}"
+    """'22' -> TB2026CERN_run_000022, 'e291' -> TB2026CERN_eudaq_run_000291; a full run name is kept (the points
+    files of the run-by-run campaigns, campaign_summary.py)."""
+    r = str(r)
+    if r.startswith("TB2026"):
+        return r
+    return f"TB2026CERN_eudaq_run_{int(r[1:]):06d}" if r.startswith("e") else f"TB2026CERN_run_{int(r):06d}"
 
 
 # One group per simulated beam point (simulation/campaign/beam_points.txt): name, set, table label, energy, beam centre (the
@@ -82,7 +95,7 @@ def load_groups(path=GROUPS_FILE):
 
 KINDS = ["data", "nodigi", "digi"]
 LABEL = {"data": "Data", "nodigi": "Sim (no digitisation)", "digi": "Sim (digitised)"}
-COLOR = {"data": "#29a3dc", "nodigi": "#eda100", "digi": "#c0392b"}
+COLOR = {"data": plot_style.DATA, "nodigi": plot_style.NODIGI, "digi": plot_style.DIGI}
 ENERGY_VARS = ["nhit_chan", "sum_hg", "sum_energy", "sum_w"]
 SHAPE_VARS = ["e_over_nhit", "moliere", "transverse_rms", "bar_r", "zbary", "shower_start", "shower_max",
               "shower_length", "n_layers_hit", "mip_likeness", "fractal_dimension"]
@@ -107,8 +120,22 @@ def showerlike(n):
     return n > 0.5 * np.percentile(n, 90)
 
 
+def sim_valtrees(g, kind, sim=None):
+    """Simulated valtrees of group g ('digi' or 'nodigi'). Group campaigns (final_v5-v9): the one file of
+    pid/<group>_<kind>/. Run-by-run campaigns (final_v10 on, simulation/campaign/make_run_sim_dag.py): the samples of
+    the group's runs, <RUN>/ecal_sim_<RUN>{,_nodigi}.valtree.root, pooled like the data runs (each simulated with the
+    statistics of its data run). Runs without a sample are left out (listed by group_samples)."""
+    sim = sim or SIM
+    v = glob.glob(f"{sim}/pid/{g['name']}_{kind}/*.valtree.root")
+    if v:
+        return v[:1]
+    suffix = "" if kind == "digi" else "_nodigi"
+    return [p for p in (f"{sim}/{r}/ecal_sim_{r}{suffix}.valtree.root" for r in g["runs"]) if os.path.exists(p)]
+
+
 def sim_valtree(g, kind):
-    v = glob.glob(f"{SIM}/pid/{g['name']}_{kind}/*.valtree.root")
+    """First simulated valtree of group g, or None (see sim_valtrees)."""
+    v = sim_valtrees(g, kind)
     return v[0] if v else None
 
 
@@ -157,7 +184,12 @@ def group_samples(g, outdir, use_cache=True, border_cut=None):
         print(f"[{g['name']}] WARNING: missing runs {sorted(set(g['runs']) - set(runs))}")
     s = {"data": load_valtrees([f"{RECO}/{r}/ecal_{r}.valtree.root" for r in runs], border_cut)}
     for kind in ("nodigi", "digi"):
-        s[kind] = load_valtrees([sim_valtree(g, kind)], border_cut)
+        v = sim_valtrees(g, kind)
+        if not v:
+            raise FileNotFoundError(f"[{g['name']}] no {kind} simulation in {SIM}")
+        if not glob.glob(f"{SIM}/pid/{g['name']}_{kind}") and len(v) != len(g["runs"]):
+            print(f"[{g['name']}] WARNING: {kind} simulation of {len(v)} of {len(g['runs'])} runs")
+        s[kind] = load_valtrees(v, border_cut)
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     np.savez(cache, **{f"{k}__{v}": s[k][v] for k in KINDS for v in keys})
     return s
@@ -305,21 +337,31 @@ def main(argv=None):
     p.add_argument("--panels9", action="store_true",
                    help="also draw panel9_<group>.png: the 9-variable panel (PANELS9) in a 3 x 3 grid")
     p.add_argument("--cal-file", default=None,
-                   help="MIP -> GeV line (mip_gev_line.txt of a pass without --border-cut) instead of fitting it")
+                   help="MIP -> GeV line (a mip_gev_line.txt) instead of fitting it on this pass's selection")
     args = p.parse_args(argv)
-    if args.border_cut is not None and not args.cal_file:
-        p.error("--border-cut needs --cal-file: the MIP -> GeV line is fitted without the cut")
     os.makedirs(args.outdir, exist_ok=True)
     groups = load_groups(args.groups_file)
+    # a group none of whose runs was simulated (run-by-run campaigns skip data runs below --min-events) is left out
+    unsimulated = [g["name"] for g in groups if not sim_valtrees(g, "nodigi")]
+    if unsimulated:
+        print(f"SKIP {len(unsimulated)} group(s) without any simulated run: {', '.join(unsimulated)}")
+        groups = [g for g in groups if g["name"] not in unsimulated]
+    # --groups with --cal-file: the line is read, so only those groups are loaded (no calibration plots); without
+    # --cal-file every group is loaded, as the line is fitted on the scans, and --groups only selects the panels
+    subset = bool(args.groups and args.cal_file)
+    if subset:
+        groups = [g for g in groups if g["name"] in set(args.groups.split(","))]
     S = {g["name"]: group_samples(g, args.outdir, not args.no_cache, args.border_cut) for g in groups}
 
     # MIP -> GeV per sample kind: the th210 scan (default), plus each SET_LINES set on its own scan
-    scan = th210_scan(groups)
-    scans = {None: scan}
-    for st, lab in SET_LINES.items():
-        sc = set_scan(groups, st, lab)
-        if sc:
-            scans[st] = sc
+    scan, scans = None, {}
+    if not subset:
+        scan = th210_scan(groups)
+        scans = {None: scan}
+        for st, lab in SET_LINES.items():
+            sc = set_scan(groups, st, lab)
+            if sc:
+                scans[st] = sc
     if args.cal_file:
         cals = read_cal_all(args.cal_file)
         cal_source = f"read from {args.cal_file}"
@@ -378,7 +420,8 @@ def main(argv=None):
         RES.append((g, {k: st[("gev", k)] for k in KINDS}))
     txt.close()
     resolution_plot(RES, f"{args.outdir}/resolution_vs_energy.png", args.border_cut)
-    calibration_plot(S, groups, scan, cal, f"{args.outdir}/calibration_th210.png", args.border_cut)
+    if scan:
+        calibration_plot(S, groups, scan, cal, f"{args.outdir}/calibration_th210.png", args.border_cut)
     for st, sc in scans.items():
         if st is not None and st in cals:
             calibration_plot(S, groups, sc, cals[st], f"{args.outdir}/calibration_{st}.png", args.border_cut,
@@ -448,7 +491,7 @@ def calibration_plot(S, groups, scan, cal, path, border_cut=None, threshold_set=
         ax.plot([], [], "D", color="0.3", mfc="none", label=f"99 GeV, {len(e99)} positions (not fitted)")
     ax.set_ylabel("sum_w, Gaussian-core $\\mu$ [MIP]"); ax.grid(alpha=0.25); ax.legend(fontsize=9, loc="upper left")
     ax.set_title(f"MIP → GeV calibration, {threshold_set} {scan_label or ''} scan: sum_w = a E + b, fitted 7.5–74 GeV" +
-                 (f"\npoints: barxy_min_border_distance > {border_cut:g} mm; line without the cut"
+                 (f"\npoints and line: barxy_min_border_distance > {border_cut:g} mm"
                   if border_cut is not None else ""), fontsize=12)
     axr.axhline(0, color="0.5", lw=1, ls="--"); axr.grid(alpha=0.25)
     axr.set_xlabel("Beam energy [GeV]"); axr.set_ylabel("residual to the line [%]")

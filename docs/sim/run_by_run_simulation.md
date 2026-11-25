@@ -143,7 +143,18 @@ named like the data files with `sim_` after the `ecal_` prefix, and `_nodigi` fo
 `run_pid_batch.py` keeps these names as they are (input `ecal_sim_<RUN>.root` → label `sim_<RUN>`). Work areas
 next to the run folders: `params/<RUN>{.data,}.json`, `dummy/<RUN>/`, `chunks/<RUN>/` (removed by the group node,
 as today), `closure/<RUN>.json`, `closure.tsv`, and `beam_points_v10.txt` (generated, one line per run in the `beam_points.txt`
-format with the tuned gun) so `FINAL_GROUPS=.../beam_points_v10.txt python analysis/final_panels.py` works.
+format with the tuned gun; the file keeps this name in every campaign).
+
+### Results
+
+The analysis scripts read a run-by-run campaign directly (since 2026-11-17; before, `final_panels.py` only knew the
+`pid/<group>_<kind>/` layout of the group campaigns): `final_panels.sim_valtrees` and `final_profiles.sim_files`
+take the samples of a group's runs and pool them like the data runs, so with the default groups file the panels are
+per group of `beam_points.txt`, comparable to final_v9 and earlier; `FINAL_GROUPS=<campaign>/beam_points_v10.txt`
+gives one panel per run. Run by run, `analysis/run_shapes.py <campaign> [--ref <campaign>]` tabulates the beam spot
+(width ratio, tails) and the shift and KS distance of each shower variable against the data. The whole chain for
+final_v11 (panels, MIP → GeV, linearity and resolution with the border cut, profiles, run_shapes, final_v9 with the
+same code) is `analysis/final_v11_results_job.sh <out>`, to run on HTCondor.
 
 ## Constraints
 

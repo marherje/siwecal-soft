@@ -23,7 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-from analysis.final_panels import (RECO, KINDS, LABEL, COLOR, load_groups, load_valtrees, sim_valtree,  # noqa: E402
+from analysis.final_panels import (RECO, KINDS, LABEL, COLOR, load_groups, load_valtrees, sim_valtrees,  # noqa: E402
                                    gauss_core, core_curve, draw_hist, PANELS as ALL_PANELS, FIT_PANELS, read_cal,
                                    selection_label)
 
@@ -40,18 +40,18 @@ def main(argv=None):
     ap.add_argument("--nbins", type=int, default=28)
     ap.add_argument("--vars", default=None, help="comma-separated variables (default: the four of the 2 x 2 panel); "
                     "Gaussian-core fit for the energy-like ones (final_panels.FIT_PANELS), median for the rest")
-    ap.add_argument("--cal-file", default=None, help="mip_gev_line.txt of a final_panels.py pass without the cut")
+    ap.add_argument("--cal-file", default=None, help="mip_gev_line.txt of the final_panels.py pass with the same cut")
     ap.add_argument("--border-cut", type=float, default=None,
                     help="keep barxy_min_border_distance > MM among the shower-like events")
     a = ap.parse_args(argv)
     if a.border_cut is not None and not a.cal_file:
-        ap.error("--border-cut needs --cal-file: the MIP -> GeV line is fitted without the cut")
+        ap.error("--border-cut needs --cal-file: the MIP -> GeV line of the final_panels.py pass with the same cut")
     os.makedirs(a.outdir, exist_ok=True)
     g = next(x for x in load_groups() if x["name"] == a.group)
     cal = read_cal(a.cal_file, g["set"]) if a.cal_file else CAL
     s = {"data": load_valtrees([f"{RECO}/{r}/ecal_{r}.valtree.root" for r in g["runs"]], a.border_cut)}
     for k in ("nodigi", "digi"):
-        s[k] = load_valtrees([sim_valtree(g, k)], a.border_cut)
+        s[k] = load_valtrees(sim_valtrees(g, k), a.border_cut)
     for k in KINDS:
         s[k]["gev"] = (s[k]["sum_w"] - cal[k][1]) / cal[k][0]
 
