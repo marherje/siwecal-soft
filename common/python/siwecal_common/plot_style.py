@@ -6,6 +6,9 @@ Common plot style of the TB2026 notes, as in the final-sample report (final_pane
   simulation, digitised    red, hatched histogram; several digitised models (geometry variants, campaigns) take a
                            gradient of reds, light to dark, each with its own hatch and line style
 
+Two productions of the same kind in one figure (data against re-reconstructed data, one simulation campaign against
+another): the reference keeps its colour and the second takes data2_points / DIGI2_STYLE, with their own markers.
+
 Binned quantities (per layer, per radial bin, per time bin) are drawn as histograms; trends with several curves
 (against energy, k, Q, distance) draw the simulations as lines and the data as points with error bars. Ratios sim / data
 (and differences sim - data) show only the simulations, against a grey reference line at 1 (or 0): no data points there.
@@ -17,12 +20,18 @@ import numpy as np
 DATA = "#29a3dc"
 NODIGI = "#eda100"
 DIGI = "#c0392b"
+# Second production of data / of digitised simulation in the same figure. The five colours were checked together for
+# colour-blind readers (worst pair DATA - DIGI2, deutan Delta E 8.4): the markers are part of the code, keep them.
+DATA2 = "#2a4d9b"
+DIGI2 = "#cc4aa6"
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 # Digitised models, light to dark around DIGI; hatches and line styles cycle with them.
 REDS = ["#f08c76", "#e0583c", "#c0392b", "#8e2116", "#5e1008"]
 HATCHES = ["////", "\\\\\\\\", "xxx", "...", "++"]
 LINESTYLES = ["-", "--", "-.", ":", (0, (5, 1, 1, 1))]
 MARKERS = ["o", "s", "^", "D", "v"]
+DIGI_STYLE = {"color": DIGI, "hatch": HATCHES[2], "ls": LINESTYLES[2], "marker": MARKERS[2]}   # = reds(3)[2], the reference
+DIGI2_STYLE = {"color": DIGI2, "hatch": "---", "ls": "--", "marker": "P"}
 
 RC = {"font.size": 9, "axes.edgecolor": INK2, "axes.labelcolor": INK, "xtick.color": INK2, "ytick.color": INK2,
       "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6, "axes.spines.top": False,
@@ -47,8 +56,16 @@ def edges_of(x):
 def data_points(ax, x, y, yerr=None, edges=None, label="data", color=DATA, **kw):
     """Data: solid points with error bars; with edges, a horizontal bar across the bin."""
     xerr = kw.pop("xerr", None) if edges is None else [x - edges[:-1], edges[1:] - x]
-    ax.errorbar(x, y, yerr=yerr, xerr=xerr, fmt=kw.pop("fmt", "o"), color=color, ms=kw.pop("ms", 5.5), mew=0,
+    ax.errorbar(x, y, yerr=yerr, xerr=xerr, fmt=kw.pop("fmt", "o"), color=color, ms=kw.pop("ms", 5.5), mew=kw.pop("mew", 0),
                 elinewidth=1.3, capsize=kw.pop("capsize", 0), label=label, zorder=5, **kw)
+
+
+def data2_points(ax, x, y, yerr=None, edges=None, label="data (2)", **kw):
+    """Second data production: open squares in DATA2, drawn as data_points."""
+    kw.setdefault("mfc", "white")
+    kw.setdefault("mew", 1.4)
+    data_points(ax, x, y, yerr, edges, label=label, color=kw.pop("color", DATA2), fmt=kw.pop("fmt", "s"),
+                ms=kw.pop("ms", 5.0), **kw)
 
 
 def sim_hist(ax, values, edges, style, label=None, fill=True):

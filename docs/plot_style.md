@@ -15,6 +15,24 @@ reference (this page only describes them):
 | Sim, no digitisation | `#eda100` (orange, `NODIGI`) | dotted histogram |
 | Sim, digitised | `#c0392b` (red, `DIGI`) | hatched histogram; the reference red |
 
+Two productions of the same kind in one figure add one colour each, with a different marker:
+
+| sample | colour | drawn as | marker | Python | ROOT |
+|---|---|---|---|---|---|
+| Data, reference production | `#29a3dc` (blue, `DATA`) | points with error bars | full circle | `data_points` | `Data` |
+| Data, second production | `#2a4d9b` (indigo, `DATA2`) | points with error bars | open square | `data2_points` | `Data2` |
+| Sim digitised, reference production | `#c0392b` (red, `DIGI`) | hatched histogram / dash-dot line | triangle | `sim_hist` / `sim_line` with `DIGI_STYLE` | `Digi` |
+| Sim digitised, second production | `#cc4aa6` (magenta, `DIGI2`) | hatched histogram / dashed line | plus | `sim_hist` / `sim_line` with `DIGI2_STYLE` | `Digi2` |
+
+- The reference is the production already in use (data as reconstructed, the current campaign); the second is the new one
+  (corrected data, another campaign). The same sample keeps its colour in every figure of a study.
+- Say in the legend what each one is ("Data, sag corrected"), not "data 1" and "data 2".
+- For a ratio between two productions (data2 / data, sim2 / sim), draw it in the colour of the numerator against the grey
+  line at 1; say in the axis title which over which.
+- Keep the markers: the five colours pass the colour-blindness checks together, but not by much (worst pair `DATA` -
+  `DIGI2`, Delta E 8.4). In a histogram with both simulations, the second is an outline (`fill=False`).
+- With three or more digitised models use the reds below, not `DIGI2`.
+
 Several digitised models in one figure (geometry variants, campaigns, digitiser settings) take a gradient of reds,
 light to dark around the reference red, each with its own hatch, line style and marker, so they stay distinct in print
 and for colour-blind readers. `reds(n)` returns the first n; model i always gets the same style, whatever n is (at
@@ -38,6 +56,7 @@ data.
 | Binned distribution: per layer, per radial bin, per time bin, a histogram | points with error bars, bin width as a horizontal bar | histograms: hatched for digitised, dotted for undigitised | `data_points`, `sim_hist`, `nodigi_hist` |
 | Trend with several curves: against energy, k, charge Q, distance | points with error bars | lines, one style per model | `data_points`, `sim_line` |
 | Ratio sim / data, difference sim − data | none: a grey reference line at 1 (or 0) | lines (or outline histograms), one style per model | `sim_line`, `sim_hist(fill=False)` |
+| Two productions, data vs data or sim vs sim | `data_points` + `data2_points` | `DIGI_STYLE` + `DIGI2_STYLE` | `sim_hist`, `sim_line` |
 | Width difference sim − data (R90, Molière radius) | none: grey line at 0 | lines, with the ±½ pad band | `pad_band` |
 
 - **Half-pad band.** On a sim − data width axis, `pad_band` shades ±2.77 mm, half of the 5.53 mm pad. It is not an
@@ -66,6 +85,15 @@ ps.sim_hist(ax, digi, edges, ref, label="Sim (digitised)")      # reference mode
 ps.sim_hist(ax, digi_v2, edges, other, label="model 1", fill=False)   # others: outlines
 ```
 
+Two productions (e.g. uncorrected data vs sim with sag, and corrected data vs sim without it):
+
+```python
+ps.data_points(ax, x, y, yerr, edges, label="Data, not corrected")
+ps.data2_points(ax, x, y2, y2err, edges, label="Data, sag corrected")
+ps.sim_hist(ax, sim, edges, ps.DIGI_STYLE, label="Sim with sag")
+ps.sim_hist(ax, sim2, edges, ps.DIGI2_STYLE, label="Sim without sag", fill=False)
+```
+
 `edges_of(x)` gives bin edges around bin centres; `data_points` takes the matplotlib `errorbar` options (`fmt`,
 `ms`, `capsize`, ...) for the rare case that needs them. Examples in the repo: `analysis/final_panels.py`,
 `analysis/position_scans.py`, `analysis/contained_resolution.py`.
@@ -82,7 +110,7 @@ digitised models as hatched histograms.
     root -l -b -q common/root/siwecal_style.C          # the example -> siwecal_style_root.png
 
 In PyROOT: `ROOT.gROOT.LoadMacro("common/root/siwecal_style.C")`, then `ROOT.siwecal.SetStyle()`,
-`ROOT.siwecal.Data(h)`, `ROOT.siwecal.Digi(h, 1)` and so on.
+`ROOT.siwecal.Data(h)`, `ROOT.siwecal.Data2(h)`, `ROOT.siwecal.Digi(h, 1)`, `ROOT.siwecal.Digi2(h)` and so on.
 
 ## Changing the style
 

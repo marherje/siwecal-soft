@@ -12,6 +12,9 @@ namespace siwecal {
 const Int_t kData = TColor::GetColor("#29a3dc");    // data: points with error bars
 const Int_t kNoDigi = TColor::GetColor("#eda100");  // simulation without digitisation: dotted line
 const Int_t kDigi = TColor::GetColor("#c0392b");    // simulation, digitised: hatched histogram
+// second production of data / of digitised simulation in the same figure (DATA2, DIGI2 of plot_style.py)
+const Int_t kData2 = TColor::GetColor("#2a4d9b");   // open squares
+const Int_t kDigi2 = TColor::GetColor("#cc4aa6");   // dashed, its own hatch, full crosses
 // several digitised models: light to dark reds, each with its own hatch and line style
 const Int_t kReds[5] = {TColor::GetColor("#f08c76"), TColor::GetColor("#e0583c"), TColor::GetColor("#c0392b"),
                         TColor::GetColor("#8e2116"), TColor::GetColor("#5e1008")};
@@ -39,6 +42,15 @@ void NoDigi(TH1* h) { h->SetLineColor(kNoDigi); h->SetLineStyle(3); h->SetLineWi
 void Digi(TH1* h, int i = 2) {  // i-th digitised model, 0 (light) .. 4 (dark); 2 = the reference red
   h->SetLineColor(kReds[i]); h->SetLineStyle(kLine[i % 5]); h->SetLineWidth(2);
   h->SetFillColor(kReds[i]); h->SetFillStyle(kHatch[i % 5]);
+}
+void Data2(TH1* h) {  // second data production: open squares with error bars
+  h->SetMarkerStyle(25); h->SetMarkerSize(1.0);
+  h->SetMarkerColor(kData2); h->SetLineColor(kData2); h->SetLineWidth(2);
+}
+void Digi2(TH1* h) {  // second digitised production
+  h->SetLineColor(kDigi2); h->SetLineStyle(2); h->SetLineWidth(2);
+  h->SetFillColor(kDigi2); h->SetFillStyle(3018);
+  h->SetMarkerColor(kDigi2); h->SetMarkerStyle(34);
 }
 }  // namespace siwecal
 
