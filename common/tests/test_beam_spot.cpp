@@ -49,6 +49,11 @@ int main() {
     const Gun g = tune(data, dummy, Gun{10, 0, 12, 12});
     CHECK(std::fabs(g.x - 12) < 1e-12 && std::fabs(g.sx - std::sqrt(119.0)) < 1e-12);
   }
+  {  // ECAL turned by 60 deg: the lab shift and the quadrature in x are cos(60) and cos^2(60) of the local ones
+    const Gun g = tune(Spot{10, 3, 12, 12, 1000}, Spot{8, 1, 13, 13, 1000}, Gun{10, 0, 12, 12}, 1.0, 60.0);
+    CHECK(std::fabs(g.x - 11) < 1e-12 && std::fabs(g.y - 2) < 1e-12);
+    CHECK(std::fabs(g.sx - std::sqrt(144 - 25 * 0.25)) < 1e-12 && std::fabs(g.sy - std::sqrt(119.0)) < 1e-12);
+  }
   {  // a dummy wider than the data floors the gun sigma at 1 mm
     const Gun g = tune(Spot{0, 0, 2, 2, 100}, Spot{0, 0, 20, 20, 100}, Gun{0, 0, 3, 3});
     CHECK(g.sx == 1.0 && g.sy == 1.0);

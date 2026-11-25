@@ -16,6 +16,7 @@ A run whose two axes stay open gets a geometry identical to the base compact (no
     collimator_prep.py step3 <out> <RUN> <base_compact> <compact_rel>
 """
 import json
+import math
 import os
 import sys
 
@@ -28,6 +29,13 @@ import collimator  # noqa: E402
 def spot_tails(valtree):
     a = uproot.open(valtree)["ecal"].arrays(["nhit_chan", "bar_x", "bar_y"], library="np")
     return {k: collimator.tails(a["nhit_chan"], a[f"bar_{k}"]) for k in ("x", "y")}
+
+
+def lab_spot(params, free_gun):
+    """Data spot in the lab, where the jaws are: (x, y, scale of the x width). The spot itself, unless the ECAL is turned
+    ("turn_deg"): then x is the gun that reproduces it on the free line and the x widths are cos(turn) shorter."""
+    turn = params.get("turn_deg", 0.0)
+    return (free_gun["x"] if turn else params["data"]["x"]), params["data"]["y"], math.cos(math.radians(turn))
 
 
 def write_geometry(base, rel, cx, cy, ax, ay, far, geo):
@@ -52,12 +60,13 @@ def step2(out, run, data_valtree, base, rel, geo=collimator.GEO):
     data, g1, far = d1["data"], d1["gun"], d1["far_collimator"]
     t_data = spot_tails(data_valtree)
     t_free = spot_tails(os.path.join(c, "pass1", "dummy", run, f"ecal_dummy_{run}.valtree.root"))
+    lx, ly, cx = lab_spot(d1, g1)
     gun0, axes = {"x": g1["x"], "y": g1["y"]}, {}
     for k in ("x", "y"):
-        a, s, why = collimator.decide(data[f"w{k}"], g1[f"s{k}"], t_free[k], t_data[k])
+        a, s, why = collimator.decide({"x": cx, "y": 1.0}[k] * data[f"w{k}"], g1[f"s{k}"], t_free[k], t_data[k])
         axes[k] = {"a_pass2": a, "why": why, "tails_data": t_data[k], "tails_free": t_free[k]}
         gun0[f"s{k}"] = s
-    write_geometry(base, rel, data["x"], data["y"], axes["x"]["a_pass2"], axes["y"]["a_pass2"], far, geo)
+    write_geometry(base, rel, lx, ly, axes["x"]["a_pass2"], axes["y"]["a_pass2"], far, geo)
     dump({"run": run, "axes": axes, "compact_pass2": rel, "free_gun": g1}, os.path.join(c, f"{run}.step2.json"))
     p = {k: v for k, v in d1.items() if k not in ("dummy", "gun")}
     p.update(gun0=gun0, far_collimator=far)
@@ -76,13 +85,15 @@ def step3(out, run, base, rel, geo=collimator.GEO):
     data, dum, far = d2["data"], d2["dummy"], d2["far_collimator"]   # the tune keeps the keys it does not use
     t2 = spot_tails(os.path.join(c, "pass2", "dummy", run, f"ecal_dummy_{run}.valtree.root"))
     gun, axes = dict(d2["gun"]), s2["axes"]
+    lx, ly, cx = lab_spot(d2, s2["free_gun"])
     for k in ("x", "y"):
         ax = axes[k]
         ax.update(w_data=data[f"w{k}"], w_pass2=dum[f"w{k}"], tails_pass2=t2[k])
-        ax["a"] = collimator.correct(ax["a_pass2"], data[f"w{k}"], dum[f"w{k}"])
+        c_k = cx if k == "x" else 1.0
+        ax["a"] = collimator.correct(ax["a_pass2"], c_k * data[f"w{k}"], c_k * dum[f"w{k}"])
         if ax["a"]:   # collimated axis: the aperture sets the width, the gun keeps the pass-2 sigma
             gun[f"s{k}"] = d2["gun0"][f"s{k}"]
-    write_geometry(base, rel, data["x"], data["y"], axes["x"]["a"], axes["y"]["a"], far, geo)
+    write_geometry(base, rel, lx, ly, axes["x"]["a"], axes["y"]["a"], far, geo)
     dump({"run": run, "axes": axes, "compact": rel, "gun": gun}, os.path.join(c, f"{run}.json"))
     d2.update(gun=gun, compact=rel, far_collimator=dict(far, ax=axes["x"]["a"], ay=axes["y"]["a"]))
     dump(d2, dst)

@@ -36,6 +36,7 @@ import subprocess
 import sys
 
 from siwecal_common import paths
+from siwecal_common.compact_geometry import ecal_turn_deg
 from make_run_list import read_runs
 from make_sim_dag import eos_mkdir
 import collimator
@@ -184,6 +185,11 @@ def main():
     write_sub(sub["summary"], "/usr/bin/python3", f"{HERE}/campaign_summary.py {out} {os.path.abspath(args.runs)}",
               None, dag_dir, "summary", "espresso", transfer=False)
 
+    # ECAL turned about y (angle scan): the data spot is in the ECAL frame, the gun in the lab (x is cos(turn) shorter)
+    turn = ecal_turn_deg(args.compact)
+    cx = math.cos(math.radians(turn))
+    if turn and coll:
+        ap.error("--far-collimator is not for a turned ECAL (its jaws sit at the ECAL-frame spot); use --rect-collimator")
     lines, groups, made, rect_runs = [], [], [], []
     for i, r in enumerate(runs, 1):
         run = r["run"]
@@ -222,8 +228,10 @@ def main():
             n_events = min(n_events, args.max_events)
         n_chunks = -(-n_events // ch)
         params = dict(r, data=spot, n_events=n_events, n_chunks=n_chunks, chunk_events=ch, dummy_events=n_dummy,
-                      gun0={"x": spot["x"], "y": spot["y"], "sx": max(spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)},
+                      gun0={"x": cx * spot["x"], "y": spot["y"], "sx": max(cx * spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)},
                       compact=compact, far_collimator=far)
+        if turn:
+            params["turn_deg"] = turn
         json.dump(params, open(os.path.join(dag_dir, "params", f"{run}.data.json"), "w"), indent=2)
         made.append(run)
         if is_rect:

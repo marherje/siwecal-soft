@@ -6,6 +6,8 @@
  *               barycentres only: centre = median (bar_x, bar_y), width = IQR / 1.349, n = selected events
  *   initialGun  gun of the dummy pass: the data centre and width (floor 1 mm)
  *   tune        x_gun = x_dummy_gun + (x_data - x_dummy);  s_gun^2 = s_dummy_gun^2 + w_data^2 - w_dummy^2 (floor 1 mm)
+ *               ECAL turned by theta about y (angle scan): the spots are in the ECAL frame, the gun in the lab, where x is
+ *               cos(theta) times shorter: x_gun = x_dummy_gun + c (x_data - x_dummy), s_x^2 = s_dummy^2 + c^2 (w^2 - w^2)
  *   productionEvents  data statistics rounded up to whole chunks (at least one)
  *   closure     production vs data: centre shift and relative width; flagged beyond 1 mm or 5 %
  */
@@ -51,13 +53,14 @@ inline Gun initialGun(const Spot& data, double floorMm = 1.0) {
   return {data.x, data.y, std::max(data.wx, floorMm), std::max(data.wy, floorMm)};
 }
 
-inline Gun tune(const Spot& data, const Spot& dummy, const Gun& dummyGun, double floorMm = 1.0) {
-  auto sigma = [floorMm](double s, double wData, double wDummy) {
-    const double s2 = s * s + wData * wData - wDummy * wDummy;
+inline Gun tune(const Spot& data, const Spot& dummy, const Gun& dummyGun, double floorMm = 1.0, double turnDeg = 0.0) {
+  const double cx = std::cos(turnDeg * 3.14159265358979323846 / 180.0);
+  auto sigma = [floorMm](double s, double wData, double wDummy, double c) {
+    const double s2 = s * s + c * c * (wData * wData - wDummy * wDummy);
     return s2 > floorMm * floorMm ? std::sqrt(s2) : floorMm;
   };
-  return {dummyGun.x + (data.x - dummy.x), dummyGun.y + (data.y - dummy.y), sigma(dummyGun.sx, data.wx, dummy.wx),
-          sigma(dummyGun.sy, data.wy, dummy.wy)};
+  return {dummyGun.x + cx * (data.x - dummy.x), dummyGun.y + (data.y - dummy.y),
+          sigma(dummyGun.sx, data.wx, dummy.wx, cx), sigma(dummyGun.sy, data.wy, dummy.wy, 1.0)};
 }
 
 inline long productionEvents(long nShowerlike, long chunk = 2000) {

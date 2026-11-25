@@ -12,6 +12,16 @@ comes after it).
   `SiPadDetector_beamline.xml` with the envelope rotation `y = <angle>*deg` and of `SND_compact_beamline.xml`
   including it. The box turns about its own centre (`Ecal_z_position`); in the test beam the pivot may have been
   elsewhere, which only moves the spot, and the tune follows the data spot anyway.
+- Frames: the line and the gun stay along z; only the ECAL turns. DD4hep hits are in the world frame, the pad maps and
+  the data in the ECAL's: `job3_digitize.py` reads the turn from the compact of the run (`COMPACT_FILE`,
+  `siwecal_common.compact_geometry.ecal_turn_deg`) and `DetectorFlipper` (`LocalFrameCompact`) brings x, y to the ECAL
+  frame with the placement in that geometry; it fails if the sample was not simulated with it. At 0 deg the output is
+  unchanged. The gun is tuned in the lab, where x is cos(turn) shorter than in the ECAL (`BeamSpot.h`, `turn_deg`), and
+  the far collimator is centred there too.
+- Checked (2026-11-25, 30 muons per angle, undigitised): straight-line fit 10.1 +- 0.7, 29.9 +- 0.3 and 44.6 +- 1.0 deg
+  at 10, 30 and 45 deg. The energy-weighted axis of 20 GeV electron showers (10 events) is biased low, about 25 deg at
+  30 deg: an effect of the estimator on tilted layers, to be studied with the MC truth. At 45 deg a muon through the
+  centre crosses about 10 layers.
 - Launcher: `simulation/campaign/launch_angle_scan.sh` (usage, options and environment in its header): per angle, the
   geometry and one DAG of `make_run_sim_dag.py` (`--rect-collimator 7.5,10`, `--seed-offset 40000000 + angle *
   100000`, `--no-summary`), all into `Simulation/Processed/<CAMPAIGN>/` (default `angle_v1`); then

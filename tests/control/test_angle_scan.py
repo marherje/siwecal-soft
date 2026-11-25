@@ -14,7 +14,9 @@ CAMPAIGN = os.path.join(ROOT, "simulation", "campaign")
 sys.path.insert(0, CAMPAIGN)
 import angle_geometry  # noqa: E402
 import collimator  # noqa: E402
+import collimator_prep  # noqa: E402
 from make_run_list import read_runs, run_name  # noqa: E402
+from siwecal_common.compact_geometry import ecal_turn_deg  # noqa: E402
 
 
 @pytest.fixture
@@ -57,6 +59,36 @@ def test_far_collimator_keeps_the_turned_detector(geo):
     assert str(geo / "generated" / "c" / "SiPadDetector_beamline_roty10.xml") in refs
     assert all(os.path.exists(r) for r in refs if r.endswith(".xml") and ("SiPad" in r or "elements" in r))
     assert "far collimator" in (geo / rel).read_text()
+
+
+@pytest.mark.parametrize("angle", [30, -5, 7.5])
+def test_turn_is_read_from_the_geometry(geo, angle):
+    """job3_digitize.py (hit frame) and make_run_sim_dag.py (gun) take the turn from the compact of the run, also from the
+    one derived with the far collimator."""
+    base = angle_geometry.write("c", angle, geo=str(geo))
+    assert ecal_turn_deg(base, geo=str(geo)) == angle
+    assert ecal_turn_deg(str(geo / base)) == angle
+    assert ecal_turn_deg("SND_compact_beamline.xml", geo=str(geo)) == 0
+    rel = collimator.write_compact(base, "generated/c/RUN.xml", -47.0, 47.0, None, ay=22.9, geo=str(geo))
+    assert ecal_turn_deg(rel, geo=str(geo)) == angle
+    rel = collimator.write_open(base, "generated/c/RUN2.xml", str(geo))
+    assert ecal_turn_deg(rel, geo=str(geo)) == angle
+
+
+def test_only_turns_about_y(geo):
+    base = angle_geometry.write("c", 10, geo=str(geo))
+    det = geo / "generated" / "c" / "SiPadDetector_beamline_roty10.xml"
+    det.write_text(det.read_text().replace('<rotation x="0"', '<rotation x="5*deg"'))
+    with pytest.raises(ValueError):
+        ecal_turn_deg(base, geo=str(geo))
+
+
+def test_collimator_centre_in_the_lab():
+    """The jaws are in the lab: at the data spot, or, with a turned ECAL, at the free-line gun; x widths cos(turn) shorter."""
+    data, gun = {"x": -20.0, "y": 5.0}, {"x": -12.0, "y": 4.0}
+    assert collimator_prep.lab_spot({"data": data}, gun) == (-20.0, 5.0, 1.0)
+    x, y, c = collimator_prep.lab_spot({"data": data, "turn_deg": 60.0}, gun)
+    assert (x, y) == (-12.0, 5.0) and abs(c - 0.5) < 1e-12
 
 
 def test_runs_angle_list():

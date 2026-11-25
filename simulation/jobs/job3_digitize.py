@@ -58,6 +58,7 @@ import yaml
 
 # Every repo file is located through siwecal_common.paths (the mappings live once, in common/mappings).
 from siwecal_common import paths  # noqa: E402
+from siwecal_common.compact_geometry import GEO, ecal_turn_deg  # noqa: E402
 from siwecal_common.slab_description import load_slab_description  # noqa: E402
 
 REPO_ROOT = paths.REPO_ROOT
@@ -217,6 +218,12 @@ with open(paths.mapping_file("slab_z_positions.yml")) as _zf:
     SLAB_Z = [float(_z) for _z in yaml.safe_load(_zf)["slab_z_mm"]]
 
 COMPACT_FILE = os.path.join(REPO_ROOT, "simulation", "geometry", "SND_compact.xml")
+# COMPACT_FILE (environment, set by the launchers): the geometry of the sample. If its ECAL is turned (angle scan) the
+# hits, which are in the world frame, are brought back to the detector frame of the pad maps by DetectorFlipper.
+SAMPLE_COMPACT = os.environ.get("COMPACT_FILE", "")
+ECAL_TURN_DEG = ecal_turn_deg(SAMPLE_COMPACT) if SAMPLE_COMPACT else 0.0
+if ECAL_TURN_DEG:
+    print(f"[job3] ECAL turned by {ECAL_TURN_DEG:g} deg about y ({SAMPLE_COMPACT}): hits in the detector frame")
 # DIGI_CALIB_DIR: the table tree for masking, pedestals, gain shape, reco table and per-cell trigger.
 # Default: the official tables on EOS (settings.yml calib_dir()/MuonCalib, re-derived on the
 # fixed-SCA-pairing chunks, {pedestals,mips,anchor,trigger}/th<N>/).
@@ -250,6 +257,8 @@ def make_flipper(name, in_coll, out_coll):
     # and warn if the two have drifted apart -- the check that would have caught the
     # table being left at the old 11 mm pitch.
     flip.CompactFile = COMPACT_FILE
+    if ECAL_TURN_DEG:
+        flip.LocalFrameCompact = os.path.join(GEO, SAMPLE_COMPACT)
     flip.BitField = SIPAD_BITFIELD_SIM
     flip.DebugFrequency = 500
     return flip

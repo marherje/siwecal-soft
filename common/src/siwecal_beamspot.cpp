@@ -4,7 +4,8 @@
  *   siwecal_beamspot measure <valtree.root> <out.json> [--tree ecal]
  *       {"x","y","wx","wy","n"} of the shower-like events (NaN written as null), "entries" = all events
  *   siwecal_beamspot tune <params.data.json> <dummy_spot.json> <out_params.json>
- *       the data params ("data" spot, "gun0" = gun of the dummy) plus "dummy" and the tuned "gun"
+ *       the data params ("data" spot, "gun0" = gun of the dummy, optional "turn_deg" of the ECAL) plus "dummy" and the
+ *       tuned "gun"
  *   siwecal_beamspot closure <params.json> <sim_spot.json> <out.json>
  *       {"data","sim","dx","dy","rwx","rwy","flag"}
  * Used by simulation/campaign/make_run_sim_dag.py and the run_sim_*.sh node scripts.
@@ -101,7 +102,7 @@ int main(int argc, char** argv) {
       json p = load(a[1]);
       const bs::Spot dummy = spot(load(a[2]));
       p["dummy"] = toJson(dummy);
-      p["gun"] = toJson(bs::tune(spot(p.at("data")), dummy, gun(p.at("gun0"))));
+      p["gun"] = toJson(bs::tune(spot(p.at("data")), dummy, gun(p.at("gun0")), 1.0, p.value("turn_deg", 0.0)));
       save(p, a[3]);
     } else if (a[0] == "closure" && a.size() == 4) {
       const json p = load(a[1]);

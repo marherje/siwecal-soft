@@ -57,12 +57,18 @@
  *   CompactFile       Compact XML to read the geometry from; may be empty if the
  *                     job already loaded one.
  *   DetectorName      DD4hep detector to take the layers from (default: SiPad).
+ *   LocalFrameCompact Compact the sample was simulated with, when its detector
+ *                     is turned (angle scan): x and y are then taken in the
+ *                     detector's own frame (the one of the pad maps and of the
+ *                     data), not in the world. Empty (default): x, y unchanged.
  *   SpacingToleranceMm  Tolerance of the ZPositions-vs-geometry check (0.5 mm).
  *   BitField          DD4hep CellID encoding string (used to decode 'layer').
  *   NLayers           Expected layer count; used to validate ZPositions length
  *                     (set to 0 to skip the check).
  *   DebugFrequency    Print per-event debug info every N events.
  */
+#include "TGeoMatrix.h"
+
 #include "Gaudi/Algorithm.h"
 #include "GaudiKernel/MsgStream.h"
 #include "k4FWCore/DataHandle.h"
@@ -73,10 +79,13 @@
 // layer N". See SiPadLayerGeometry.h.
 #include "siwecal/SiPadLayerGeometry.h"
 #include "DD4hep/Detector.h"
+#include "DD4hep/DD4hepUnits.h"
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -110,8 +119,9 @@ public:
                << m_z.size() << " layers)." << endmsg;
         // A supplied table is a second copy of the geometry, so check it still
         // describes the same detector rather than letting it drift unnoticed.
-        crossCheckAgainstGeometry();
+        if (m_localFrameCompact.value().empty()) crossCheckAgainstGeometry();
       }
+      if (!m_localFrameCompact.value().empty() && !loadLocalFrame()) return StatusCode::FAILURE;
 
       const auto& zpos = m_z;
       const int nLayers = m_nLayers.value();
@@ -181,6 +191,40 @@ public:
     return true;
   }
 
+  /// The world placement of the detector, from the geometry the sample was
+  /// simulated with: the same source as the hits, so the two cannot disagree.
+  bool loadLocalFrame() {
+    auto& desc = dd4hep::Detector::getInstance();
+    try {
+      // "both" chains: the second flipper finds the geometry already loaded
+      if (desc.state() != dd4hep::Detector::READY) desc.fromXML(m_localFrameCompact.value());
+      m_toWorld = desc.detector(m_detectorName.value()).nominal().worldTransformation();
+    } catch (const std::exception& e) {
+      error() << "[DetectorFlipper] cannot read the placement of " << m_detectorName.value() << " from "
+              << m_localFrameCompact.value() << ": " << e.what() << endmsg;
+      return false;
+    }
+    m_localZ.assign(m_z.size(), std::numeric_limits<double>::quiet_NaN());
+    const double* r = m_toWorld.GetRotationMatrix();
+    const double* t = m_toWorld.GetTranslation();
+    info() << "[DetectorFlipper] hits in the frame of " << m_detectorName.value() << ", turned by "
+           << std::atan2(r[2], r[8]) * 180. / M_PI << " deg about y, centre (" << t[0] / dd4hep::mm << ", "
+           << t[1] / dd4hep::mm << ", " << t[2] / dd4hep::mm << ") mm" << endmsg;
+    return true;
+  }
+
+  /// World -> detector frame [mm]. Every hit of a layer must come out at the same
+  /// local z: if not, the sample was not simulated with this geometry.
+  bool toLocal(const edm4hep::Vector3f& p, int layer, double out[3]) const {
+    const double w[3] = {p.x * dd4hep::mm, p.y * dd4hep::mm, p.z * dd4hep::mm};
+    m_toWorld.MasterToLocal(w, out);
+    for (int i = 0; i < 3; ++i) out[i] /= dd4hep::mm;
+    if (layer < 0 || layer >= static_cast<int>(m_localZ.size())) return true;
+    const std::lock_guard<std::mutex> lock(m_localZMutex);
+    if (std::isnan(m_localZ[layer])) m_localZ[layer] = out[2];
+    return std::abs(m_localZ[layer] - out[2]) < 0.1;
+  }
+
   /// Warn when a configured ZPositions no longer matches the layer spacing of
   /// the geometry. Compares |z[i+1]-z[i]|, so it is insensitive to the sign and
   /// offset a frame change legitimately introduces, and catches the thing that
@@ -245,7 +289,17 @@ public:
         nh.setCellID(cellID);
         nh.setEnergy(hit.getEnergy());
         const auto& p = hit.getPosition();
-        nh.setPosition({p.x, p.y, newZ});
+        if (m_localFrameCompact.value().empty()) {
+          nh.setPosition({p.x, p.y, newZ});
+        } else {
+          double local[3];
+          if (!toLocal(p, layer, local)) {
+            error() << "[DetectorFlipper] hits of layer " << layer << " at local z " << m_localZ[layer] << " and "
+                    << local[2] << " mm: the sample was not simulated with " << m_localFrameCompact.value() << endmsg;
+            return StatusCode::FAILURE;
+          }
+          nh.setPosition({static_cast<float>(local[0]), static_cast<float>(local[1]), newZ});
+        }
 
         if (doPrint) {
           debug() << "  layer=" << layer
@@ -305,6 +359,10 @@ private:
       "left empty if the job already loaded a DD4hep geometry."};
   Gaudi::Property<std::string> m_detectorName{
       this, "DetectorName", "SiPad", "DD4hep detector to take the layers from"};
+  Gaudi::Property<std::string> m_localFrameCompact{
+      this, "LocalFrameCompact", "",
+      "Compact XML of a sample simulated with a turned detector: x, y are written in the "
+      "detector's own frame. Empty: x, y as in the input"};
   Gaudi::Property<double> m_spacingTolerance{
       this, "SpacingToleranceMm", 0.5,
       "How far a configured ZPositions layer spacing may differ from the "
@@ -320,6 +378,10 @@ private:
 
   /// The z table actually in use: either ZPositions or the DD4hep geometry.
   std::vector<double> m_z;
+
+  TGeoHMatrix                 m_toWorld;  ///< placement of the detector (LocalFrameCompact)
+  mutable std::vector<double> m_localZ;   ///< local z of each layer, from its first hit
+  mutable std::mutex          m_localZMutex;
 
   mutable std::unique_ptr<dd4hep::DDSegmentation::BitFieldCoder> m_decoder;
   mutable std::unique_ptr<k4FWCore::DataHandle<edm4hep::SimCalorimeterHitCollection>> m_inputHandle;
