@@ -14,6 +14,7 @@
 #                  not done)
 # Writes nothing outside <out>; refuses an existing <out>/run_shapes.tsv.
 #   CACHE_FROM=<earlier out>  copy its per-group event caches (same selection) instead of re-reading every valtree
+#   DATA, DATA_TREES          data valtrees and ecal trees (default Reconstruction); both, for a re-reconstructed data set
 #   SKIP_SHAPES=1             no run_shapes.tsv (it does not depend on the calibration)
 # Test while the campaign runs (default: neither, every group and the line fitted on the scans):
 #   ONLY_GROUPS=g1,g2,...  final_panels.py on those groups only; needs CAL_FILE (the scans are incomplete)
@@ -42,7 +43,7 @@ caches() {   # caches() <subdir>: the event caches of CACHE_FROM/<subdir>, copie
   for cache in "$CACHE_FROM/$1"/cache_*; do [ -d "$cache" ] && cp -rn "$cache" "$OUT/$1/"; done; return 0
 }
 
-export FINAL_SIM=$SIM FINAL_RECO=$DATA FINAL_RECO_TREES=$B/Reconstruction
+export FINAL_SIM=$SIM FINAL_RECO=$DATA FINAL_RECO_TREES=${DATA_TREES:-$B/Reconstruction}   # data ecal trees of the profiles
 caches nocut
 step python3 analysis/final_panels.py "$OUT/nocut" $ONLY $CAL0
 for c in $CUTS; do
