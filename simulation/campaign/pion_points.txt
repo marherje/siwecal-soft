@@ -1,0 +1,9 @@
+# Pion background at E2 (th230), one file per energy, for the e/pi encoders: make_sim_dag.py --points
+# simulation/campaign/pion_points.txt (docs/sim/pion_samples.md). Simulation only (no data runs). Centre and sigma of the
+# E2 pions of bkg_points.txt (sigma = the 34 GeV e+ beam), the same at every energy. Columns of beam_points.txt + particle.
+# name                          set    label  E      x     y     sx     sy     runs  particle
+th230_E2_pi_e10                 th230  E2     10    -43   -35   13.7    9.5   -     pi+
+th230_E2_pi_e20                 th230  E2     20    -43   -35   13.7    9.5   -     pi+
+th230_E2_pi_e30                 th230  E2     30    -43   -35   13.7    9.5   -     pi+
+th230_E2_pi_e40                 th230  E2     40    -43   -35   13.7    9.5   -     pi+
+th230_E2_pi_e50                 th230  E2     50    -43   -35   13.7    9.5   -     pi+

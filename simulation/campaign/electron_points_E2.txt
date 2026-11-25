@@ -1,0 +1,8 @@
+# Electrons at E2 (th230) with more statistics than final_v11, to train the encoders: make_sim_dag.py --points
+# simulation/campaign/electron_points_E2.txt (docs/sim/pion_samples.md). Simulation only; columns of beam_points.txt.
+# 52 and 74 GeV: gun of final_v11 tuned on runs 28 and 29. 99 GeV: no data run at E2 in runs_v10.txt; centre of the 74 GeV
+# gun and width of run 48 (99 GeV, E5), an assumption.
+# name                          set    label  E      x     y     sx     sy     runs  particle
+th230_E2_el_e52                 th230  E2     52    -43.8 -34.1  10.1    3.7   -     e-
+th230_E2_el_e74                 th230  E2     74    -44.1 -33.3  10.2    4.3   -     e-
+th230_E2_el_e99                 th230  E2     99    -44.1 -33.3  10.6    5.0   -     e-

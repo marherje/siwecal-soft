@@ -1,0 +1,9 @@
+# Pion runs of TB2026-Run_Summary.xlsx (ThresholdDAC 210, table (H, V) = (1.159, 1.171) m, about (-21, -8) mm in the
+# ECAL, interpolated from runs 166-169), run by run: simulation/campaign/make_run_sim_dag.py --runs
+# simulation/campaign/runs_pion.txt (docs/sim/pion_samples.md). Position of 164 not recorded. Run 163 (85 events) left
+# out. The charge is not in the summary: pi+ assumed (positron beam before and after). Same columns as runs_v10.txt.
+# RUN                           set    label  E     particle
+TB2026CERN_eudaq_run_000161     th210  PI     10    pi+
+TB2026CERN_eudaq_run_000162     th210  PI     10    pi+
+TB2026CERN_eudaq_run_000164     th210  PI     20    pi+
+TB2026CERN_eudaq_run_000165     th210  PI     30    pi+
