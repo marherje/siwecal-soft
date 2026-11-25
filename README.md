@@ -44,6 +44,8 @@ so a batch job runs in the same environment as an interactive shell.
   relative name is looked up in `$SIWECAL_MAPPINGS`, then `$SIWECAL_SOFT_ROOT`, then the working directory.
 - **Steering** (`*/options/*.py`, `simulation/jobs/*.py`) takes its inputs from environment variables. Without them
   it stops with a message that names what is missing.
+- **Plots** follow one style for data and simulation (colours, hatches, how each kind of plot is drawn):
+  [docs/plot_style.md](docs/plot_style.md), code in `siwecal_common.plot_style` and `common/root/siwecal_style.C`.
 
 ## The chains
 
