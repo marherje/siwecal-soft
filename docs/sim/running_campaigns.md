@@ -10,7 +10,6 @@ On lxplus (EL9), in your AFS area. The jobs read the scripts and `install/` of t
 whole campaign: do not rebuild, pull or change branch in it while a DAG runs.
 
     git clone git@github.com:marherje/siwecal-soft.git && cd siwecal-soft
-    git checkout far-collimator          # the branch with these launchers
     source init_siwecalsoft.sh           # Key4hep release pinned in .key4hep-release
     ./build.sh                           # Gaudi plugins, DD4hep detector, siwecal_beamspot -> install/
     python3 -m pytest -q tests/control/test_rerun_sim_dag.py tests/control/test_angle_scan.py
