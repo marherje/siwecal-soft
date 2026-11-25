@@ -1,0 +1,9 @@
+# Muon runs at normal incidence for the tracking study, run by run (simulation/campaign/make_run_sim_dag.py --runs
+# simulation/campaign/runs_muon.txt): 150 GeV mu-, one run per threshold set, the runs of muon_points.txt (the
+# muon points of the group campaign final_v7_muons). Data valtrees in Reconstruction/. Same columns as runs_v10.txt.
+# The data runs are long (85: 3.9 M events): cap the production with --max-events (docs/sim/angle_scan_simulation.md).
+# The 45 deg muons are in runs_angle.txt (label M45).
+# RUN                           set    label  E     particle
+TB2026CERN_eudaq_run_000151     th210  M0     150   mu-
+TB2026CERN_run_000085           th220  M0     150   mu-
+TB2026CERN_run_000004           th230  M0     150   mu-

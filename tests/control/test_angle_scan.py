@@ -66,15 +66,34 @@ def test_runs_angle_list():
         f = line.split("#")[0].split()
         if f:
             angles[f[0]] = int(f[5])
-    assert len(runs) == 20 and sorted(set(angles.values())) == [5, 10, 30]
-    scan = {run_name("e" + str(r)) for r in yaml.safe_load(open(os.path.join(
-        ROOT, "data_conversion", "jobs", "angular_scan", "runs.yml")))["runs"]}
+    assert len(runs) == 24 and sorted(set(angles.values())) == [5, 10, 30, 45]
+    data = yaml.safe_load(open(os.path.join(ROOT, "data_conversion", "jobs", "angular_scan", "runs.yml")))
+    scan = {run_name("e" + str(r)) for r in data["runs"]}
     assert {r["run"] for r in runs} <= scan
-    for r in runs:
+    positrons = [r for r in runs if r["particle"] == "e-"]
+    muons = [r for r in runs if r["particle"] == "mu-"]
+    assert len(positrons) == 20 and len(muons) == 4
+    for r in positrons:
         assert r["set"] == "th210" and r["label"] == f"A{angles[r['run']]}"
     for a in (5, 10, 30):   # one energy scan per angle
-        es = sorted(float(r["E"]) for r in runs if angles[r["run"]] == a)
+        es = sorted(float(r["E"]) for r in positrons if angles[r["run"]] == a)
         assert {7.5, 10, 20, 34, 52, 74} <= set(es)
+    # the 45 deg muons: 150 GeV, the threshold set of their data reconstruction
+    th = {run_name("e" + str(n)): f"th{t}" for n, t in data.get("thresholds", {}).items()}
+    for r in muons:
+        assert (r["label"], float(r["E"]), angles[r["run"]]) == ("M45", 150, 45)
+        assert r["set"] == th.get(r["run"], f"th{data['threshold']}")
+    assert sorted(r["set"] for r in muons) == ["th210", "th220", "th230", "th230"]
+    assert not {r["run"] for r in runs} & {r["run"] for r in read_runs(os.path.join(CAMPAIGN, "runs_v10.txt"))}
+
+
+def test_runs_muon_list():
+    """Normal-incidence muons for tracking: one 150 GeV run per threshold set, the runs of muon_points.txt."""
+    runs = read_runs(os.path.join(CAMPAIGN, "runs_muon.txt"))
+    assert sorted(r["set"] for r in runs) == ["th210", "th220", "th230"]
+    assert all((r["particle"], float(r["E"]), r["label"]) == ("mu-", 150, "M0") for r in runs)
+    points = [ln.split() for ln in open(os.path.join(CAMPAIGN, "muon_points.txt")) if ln.strip() and ln[0] != "#"]
+    assert {r["run"] for r in runs} == {run_name(p[-1]) for p in points}
     assert not {r["run"] for r in runs} & {r["run"] for r in read_runs(os.path.join(CAMPAIGN, "runs_v10.txt"))}
 
 

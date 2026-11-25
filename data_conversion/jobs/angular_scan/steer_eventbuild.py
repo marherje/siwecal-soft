@@ -1,10 +1,11 @@
 #
-# Gaudi/k4FWCore steering of the angular scan (th210), event-building stage, for the run in ANGSCAN_RUN:
-# siwecaldecoded chunks -> event-built `ecal` tree, with the FULL th210 calibration of the official tables
-# (calib_dir()/MuonCalib on EOS): pedestals/th210/, mips/th210/ and the LG->HG anchor anchor/th210/.
+# Gaudi/k4FWCore steering of the angular scan, event-building stage, for the run in ANGSCAN_RUN:
+# siwecaldecoded chunks -> event-built `ecal` tree, with the FULL calibration of the run's threshold (runs.yml:
+# `threshold`, th210, or the run's entry in `thresholds`: the 45 deg muon runs at th220/th230) from the official
+# tables (calib_dir()/MuonCalib on EOS): pedestals/th<N>/, mips/th<N>/ and the LG->HG anchor anchor/th<N>/.
 #
-# Every table is th210's own (per-threshold calibration; nothing is borrowed from another threshold). The anchor
-# line (k, c) and the pedestal-subtracted switch are read from anchor/th210/gain_anchor_th210.txt.
+# Every table is the threshold's own (per-threshold calibration; nothing is borrowed from another threshold). The
+# anchor line (k, c) and the pedestal-subtracted switch are read from anchor/th<N>/gain_anchor_th<N>.txt.
 #
 # One steering for every run of runs.yml (the 55 per-run copies of siwecal-tb2026 differed only in the run number);
 # from already-converted chunks (no CONVERT step -- see data_conversion/jobs/condor/generate_convert_eudaq_dag.py).
@@ -31,7 +32,7 @@ _NUM = int(os.environ["ANGSCAN_RUN"].rsplit("_", 1)[-1])
 if _NUM not in _SCAN["runs"]:
     raise SystemExit(f"run {_NUM} is not in the angular scan (runs.yml)")
 _RUN = f"TB2026CERN_eudaq_run_{_NUM:06d}"
-_TH = str(_SCAN["threshold"])
+_TH = str(_SCAN.get("thresholds", {}).get(_NUM, _SCAN["threshold"]))
 _CALIB = paths.muon_calib_dir()
 _MAPPINGS = paths.mappings_dir()
 

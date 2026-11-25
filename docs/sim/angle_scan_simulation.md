@@ -5,8 +5,9 @@ vertical axis. Not run yet: it needs the data valtrees of the angle runs (the be
 them, as in final_v11), which do not exist yet (`data_conversion/jobs/angular_scan/` builds the events; the valtree
 comes after it).
 
-- Runs: `simulation/campaign/runs_angle.txt`, the 20 runs of the physics scan (5, 10, 30 deg; 7.5, 10, 20, 34, 52,
-  74 GeV; th210). Left out: the 45 deg, 99 GeV runs (TDC and delay tests) and the runs without physics content.
+- Runs: `simulation/campaign/runs_angle.txt`, the 20 positron runs of the physics scan (5, 10, 30 deg; 7.5, 10, 20,
+  34, 52, 74 GeV; th210) and 4 muon runs at 45 deg (below). Left out: the 45 deg, 99 GeV positron runs (TDC and
+  delay tests) and the runs without physics content.
 - Geometry: `simulation/campaign/angle_geometry.py <campaign> <angle>` writes `generated/<campaign>/` copies of
   `SiPadDetector_beamline.xml` with the envelope rotation `y = <angle>*deg` and of `SND_compact_beamline.xml`
   including it. The box turns about its own centre (`Ecal_z_position`); in the test beam the pivot may have been
@@ -24,5 +25,26 @@ against the data: `ANGLE_SIGN=-1` turns the other way):
 
     CAMPAIGN=test_angle ANGLES=30 bash simulation/campaign/launch_angle_scan.sh --only TB2026CERN_eudaq_run_000212 \
         --dummy-events 500 --max-events 1000 --chunk-events 500 --submit
+
+## Muons, for tracking
+
+Tracking is studied with muons: at normal incidence a muon stays in the same pad on most slabs, so the track
+chi2/ndf sits near zero by construction (`docs/data/acts_integration.md`); turned at 45 deg it changes pad from slab
+to slab and the fit quality means something.
+
+- **45 deg**: runs 253 (th210), 254 (th220), 255 and 256 (th230), 150 GeV, label `M45` in `runs_angle.txt`;
+  thresholds from each run's `Run_Settings.txt`. The rest of that muon scan (259-260, 265, 266: thresholds 205, 200,
+  195) has no calibration tables. Data: `data_conversion/jobs/angular_scan/` (runs.yml, per-run `thresholds`), then
+  `reconstruction/jobs/pid_to_valtree.py` for the valtree. Simulation: `ANGLES=45 bash
+  simulation/campaign/launch_angle_scan.sh`.
+- **0 deg**: `simulation/campaign/runs_muon.txt`, one run per threshold set (e151, 85, 4: the runs of
+  `muon_points.txt`), whose data valtrees already exist. Cap the production, the data runs are long:
+
+      python3 simulation/campaign/make_run_sim_dag.py --campaign muon_v1 --runs simulation/campaign/runs_muon.txt \
+          --seed-offset 60000000 --max-events 200000            # check the printout; then the same with --submit
+
+The beam spot of each run is measured and tuned as for the electrons (shower-like cut nhit > 0.5 x p90, which keeps
+most muons); the muon beam is wider than the ECAL, so it is the profile seen by the ECAL. Check the tune on one run
+first.
 
 Tests: `pytest tests/control/test_angle_scan.py`.

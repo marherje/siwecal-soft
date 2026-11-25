@@ -1,5 +1,12 @@
-# Angular scan, th210: runs 179-239 minus 197, 217-220 (no data) and 225 (empty conversion). See README.md.
+# Angular scan: runs 179-239 minus 197, 217-220 (no data) and 225 (empty conversion), positrons, th210; and the
+# 45 deg, 150 GeV muon runs 253-256 (a threshold scan: ThresholdDAC of each run's Run_Settings.txt). See README.md.
+# Muon runs left out: 259-260 (205), 265 (200), 266 (195): no calibration tables at those thresholds; 272: 1005 events.
 threshold: 210
+thresholds:          # runs not at `threshold`
+  254: 220
+  255: 230
+  256: 230
 runs: [179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 198, 199, 200, 201,
        202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 221, 222, 223, 224, 226, 227, 228,
-       229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239]
+       229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239,
+       253, 254, 255, 256]

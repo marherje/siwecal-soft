@@ -9,8 +9,11 @@ exist.
 
 One parametrised steering pair for all runs: `steer_eventbuild.py` (event builder) and `validate.py`
 (EDM4hep + PID), with the run in `ANGSCAN_RUN` and the run list and threshold in `runs.yml`
-(siwecal-tb2026 kept 55 copies of each, which differed only in the run number). All 55 runs are
-**th210**, calibrated with the official tables, `calib_dir()/MuonCalib/*/th210/`.
+(siwecal-tb2026 kept 55 copies of each, which differed only in the run number). The 55 positron runs are
+**th210**, calibrated with the official tables, `calib_dir()/MuonCalib/*/th210/`. The 4 muon runs at 45 deg
+(150 GeV, a threshold scan) take the tables of their own threshold, from `thresholds` in `runs.yml`: 253 th210,
+254 th220, 255 and 256 th230 (ThresholdDAC of their `Run_Settings.txt`). The other runs of that muon scan,
+259-260 (205), 265 (200) and 266 (195), have no calibration tables and are left out; 272 has 1005 events.
 
 ## Runs
 
@@ -54,11 +57,12 @@ bash data_conversion/jobs/angular_scan/run_all.sh
 ```
 
 Sequential, local, idempotent (skips a run whose `ecal_<RUN>.edm4hep.root`
-already exists unless `--force`). For farm-scale parallelism instead, use
-`data_conversion/jobs/condor/generate_reco_dag.py --runs <comma-separated run names>
---out-dir ... ` (its CONVERT stage will just verify the chunks are already
-there and fall straight through to RECO/VALIDATE — see that script's
-`--convert-only` note).
+already exists unless `--force`); on lxplus run it inside an HTCondor job.
+
+**Do not submit the CONVERT nodes of `data_conversion/jobs/condor/generate_reco_dag.py` for the positron runs.**
+They are decoded in one `chunk_0000.root`, but the generator lists every raw `.bin` file and CONVERT would write
+chunk_0001... into the shared decoded data. To use that DAG, mark the `JOB convert_*` lines `DONE` first (as
+`simulation/campaign/launch_pions.sh reco` does).
 
 ## Adapt to a different run / threshold
 

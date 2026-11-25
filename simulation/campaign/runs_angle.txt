@@ -1,8 +1,10 @@
 # Runs of the angular-scan simulation (simulation/campaign/launch_angle_scan.sh): the physics angle scan of
-# TB2026-Run_Summary.xlsx, th210, ECAL turned about the vertical axis by <angle> degrees. Left out: the 45 deg, 99 GeV
-# runs 221-239 (TDC configuration and delay tests) and the angle-scan runs without physics content (188-192, 196,
-# 199-201, 205-208, 215-216). Same columns as runs_v10.txt (make_run_list.read_runs) plus the angle; the label groups
-# the runs of one angle. Positrons in the data, e- as in final_v11.
+# TB2026-Run_Summary.xlsx, ECAL turned about the vertical axis by <angle> degrees. Positrons at 5, 10, 30 deg
+# (th210; e- as in final_v11) and the 150 GeV muons at 45 deg (label M45, for tracking; the set is each run's
+# threshold, as in data_conversion/jobs/angular_scan/runs.yml). Left out: the 45 deg, 99 GeV positron runs 221-239
+# (TDC configuration and delay tests), the angle-scan runs without physics content (188-192, 196, 199-201, 205-208,
+# 215-216) and the muon runs without calibration (259-260, 265, 266) or statistics (272). Same columns as
+# runs_v10.txt (make_run_list.read_runs) plus the angle; the label groups the runs of one angle.
 # RUN                           set    label  E     particle  angle_deg
 TB2026CERN_eudaq_run_000181     th210  A5     7.5   e-        5
 TB2026CERN_eudaq_run_000183     th210  A5     7.5   e-        5
@@ -24,3 +26,7 @@ TB2026CERN_eudaq_run_000212     th210  A30    20    e-        30
 TB2026CERN_eudaq_run_000211     th210  A30    34    e-        30
 TB2026CERN_eudaq_run_000210     th210  A30    52    e-        30
 TB2026CERN_eudaq_run_000209     th210  A30    74    e-        30
+TB2026CERN_eudaq_run_000253     th210  M45    150   mu-       45
+TB2026CERN_eudaq_run_000254     th220  M45    150   mu-       45
+TB2026CERN_eudaq_run_000255     th230  M45    150   mu-       45
+TB2026CERN_eudaq_run_000256     th230  M45    150   mu-       45
