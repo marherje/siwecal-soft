@@ -47,14 +47,15 @@ to slab and the fit quality means something.
   195) has no calibration tables. Data: `data_conversion/jobs/angular_scan/` (runs.yml, per-run `thresholds`), then
   `reconstruction/jobs/pid_to_valtree.py` for the valtree. Simulation: `ANGLES=45 bash
   simulation/campaign/launch_angle_scan.sh`.
-- **0 deg**: `simulation/campaign/runs_muon.txt`, one run per threshold set (e151, 85, 4: the runs of
-  `muon_points.txt`), whose data valtrees already exist. Cap the production, the data runs are long:
+- **0 deg**: `simulation/campaign/muon_points.txt` (runs e151, 85, 4), whose data valtrees already exist:
 
-      python3 simulation/campaign/make_run_sim_dag.py --campaign muon_v1 --runs simulation/campaign/runs_muon.txt \
-          --seed-offset 60000000 --max-events 200000            # check the printout; then the same with --submit
+      python3 simulation/campaign/make_sim_dag.py --campaign muon_v1 --points simulation/campaign/muon_points.txt \
+          --particle mu- --nevents 200000 --seed-offset 60000000      # check the printout; then the same with --submit
 
-The beam spot of each run is measured and tuned as for the electrons (shower-like cut nhit > 0.5 x p90, which keeps
-most muons); the muon beam is wider than the ECAL, so it is the profile seen by the ECAL. Check the tune on one run
-first.
+  Not `make_run_sim_dag.py --runs runs_muon.txt`: its spot is the one of the shower-like events. In run 4, where p90 of
+  nhit is 454, that is 14.5 x 10.6 mm; its track-like events (n_layers_hit >= 10, nhit <= 30) give 36 x 39 mm.
+
+At 45 deg the run-by-run tuning has the same problem: do not launch the 45 deg runs until their gun comes from track-like
+events. The muon runs of the data also hold showers (run 4 above all): select the tracks.
 
 Tests: `pytest tests/control/test_angle_scan.py`.
