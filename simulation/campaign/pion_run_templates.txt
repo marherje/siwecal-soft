@@ -1,0 +1,13 @@
+# Templates for the "pion" runs 161-162 (10 GeV), 164 (20 GeV), 165 (30 GeV), th210: e+, pi+ and the muon halo simulated
+# separately, to fit the mixture of the data (most events are EM showers: docs/sim/pion_samples.md). make_sim_dag.py --points
+# simulation/campaign/pion_run_templates.txt. Columns of beam_points.txt + particle.
+# e+ and pi+: centre and width of the entry point (layers 0-2) of the EM-like events of the runs (same beam for both: the
+# position does not separate them). mu+: the MIP-like halo of runs 161-162, which is off-centre and wide.
+# name                          set    label  E     x     y     sx     sy     runs       particle
+th210_pirun_e10_eplus           th210  PI     10   -24   -14   21.0   19.0   e161,e162  e+
+th210_pirun_e10_piplus          th210  PI     10   -24   -14   21.0   19.0   e161,e162  pi+
+th210_pirun_e20_eplus           th210  PI     20   -20   -24   13.1   10.0   e164       e+
+th210_pirun_e20_piplus          th210  PI     20   -20   -24   13.1   10.0   e164       pi+
+th210_pirun_e30_eplus           th210  PI     30   -19   -18    8.2    5.8   e165       e+
+th210_pirun_e30_piplus          th210  PI     30   -19   -18    8.2    5.8   e165       pi+
+th210_pirun_e10_muplus          th210  PI     10   -14    -8   48.0   50.0   e161,e162  mu+
