@@ -1,0 +1,10 @@
+# Muons on the ECAL turned by 45 deg (data runs 253 th210, 254 th220, 255-256 th230), for tracking: make_sim_dag.py --points
+# simulation/campaign/muon45_points.txt --particle mu- --compact <generated roty45 compact> (docs/sim/angle_scan_simulation.md).
+# Same columns as beam_points.txt; x, y, sx, sy are the gun in the LAB. The muon beam is wider than the turned ECAL:
+# y = median barycentre of the track-like data events (n_layers_hit >= 7, nhit <= 30: -22 to -26 mm); x = 0, the axis through
+# the centre of the box (the data sit at -5 mm in the ECAL frame, shaped by the acceptance); sigma 43 x 45 mm as at 0 deg.
+# The data are events with about 10 layers or more (p10 of nhit is 10): apply the same cut to the simulation.
+# name                          set    label  E     x     y     sx     sy     runs
+th210_mu150_a45                 th210  M45    150    0   -22   43.0   45.0  e253
+th220_mu150_a45                 th220  M45    150    0   -25   43.0   45.0  e254
+th230_mu150_a45                 th230  M45    150    0   -25   43.0   45.0  e255,e256
