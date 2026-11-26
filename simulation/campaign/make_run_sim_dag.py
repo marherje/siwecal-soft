@@ -36,7 +36,7 @@ import subprocess
 import sys
 
 from siwecal_common import paths
-from siwecal_common.compact_geometry import ecal_turn_deg
+from siwecal_common.compact_geometry import ecal_turn_deg, lab_x, layer_depths
 from make_run_list import read_runs
 from make_sim_dag import eos_mkdir
 import collimator
@@ -50,6 +50,15 @@ def measure(valtree, out_json):
     """siwecal_beamspot measure -> the spot dict (C++: siwecal/BeamSpot.h)."""
     subprocess.run(["siwecal_beamspot", "measure", valtree, out_json], check=True)
     return json.load(open(out_json))
+
+
+def shower_zbary(valtree):
+    """Median zbary (layer units) of the shower-like events (nhit > 0.5 p90, as siwecal_beamspot measure)."""
+    import numpy as np
+    import uproot
+    a = uproot.open(valtree)["ecal"].arrays(["nhit_chan", "zbary"], library="np")
+    k = (a["nhit_chan"] > 0.5 * np.percentile(a["nhit_chan"], 90)) & np.isfinite(a["zbary"])
+    return float(np.median(a["zbary"][k]))
 
 
 def group_disk_mb(n_events):
@@ -188,6 +197,7 @@ def main():
     # ECAL turned about y (angle scan): the data spot is in the ECAL frame, the gun in the lab (x is cos(turn) shorter)
     turn = ecal_turn_deg(args.compact)
     cx = math.cos(math.radians(turn))
+    depths = layer_depths() if turn else None
     if turn and coll:
         ap.error("--far-collimator is not for a turned ECAL (its jaws sit at the ECAL-frame spot); use --rect-collimator")
     lines, groups, made, rect_runs = [], [], [], []
@@ -228,10 +238,14 @@ def main():
             n_events = min(n_events, args.max_events)
         n_chunks = -(-n_events // ch)
         params = dict(r, data=spot, n_events=n_events, n_chunks=n_chunks, chunk_events=ch, dummy_events=n_dummy,
-                      gun0={"x": cx * spot["x"], "y": spot["y"], "sx": max(cx * spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)},
+                      gun0={"x": spot["x"], "y": spot["y"], "sx": max(cx * spot["wx"], 1.0), "sy": max(spot["wy"], 1.0)},
                       compact=compact, far_collimator=far)
         if turn:
-            params["turn_deg"] = turn
+            # the barycentre is at the depth of the shower: the lab x of the beam is not cos(turn) x alone. Missing the
+            # depth puts the gun where the beam enters through the side of the box (late showers, narrow spot).
+            zbary = shower_zbary(valtree)
+            params["turn_deg"], params["data_zbary"] = turn, zbary
+            params["gun0"]["x"] = lab_x(spot["x"], zbary, turn, depths)
         json.dump(params, open(os.path.join(dag_dir, "params", f"{run}.data.json"), "w"), indent=2)
         made.append(run)
         if is_rect:

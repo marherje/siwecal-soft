@@ -2,9 +2,40 @@
 import os
 import re
 
+import numpy as np
+
 from siwecal_common import paths
 
 GEO = os.path.join(paths.REPO_ROOT, "simulation", "geometry")
+
+
+def layer_depths(compact="SND_compact_beamline.xml", geo=GEO, detector="SiPad"):
+    """Depth [mm] of the sensitive slice of each layer in the ECAL frame (from the box centre, along the beam), read with
+    DD4hep from the untilted geometry; needs Key4hep. Layer 0 is at -107.95 mm in SND_compact_beamline.xml."""
+    import dd4hep
+    path = compact if os.path.isabs(compact) else os.path.join(geo, compact)
+    desc = dd4hep.Detector.getInstance()
+    desc.fromXML("file:" + path)
+    centre = desc.constantAsDouble("Ecal_z_position")
+
+    def sensitive(v):
+        return dd4hep.Volume(v).isSensitive() or any(sensitive(v.GetNode(i).GetVolume()) for i in range(v.GetNdaughters()))
+
+    depth = {}
+    for _, layer in desc.detector(detector).children():
+        for _, s in layer.children():
+            if sensitive(s.placement().GetVolume()):
+                depth[layer.id()] = (s.nominal().worldTransformation().GetTranslation()[2] - centre) / dd4hep.mm
+    return [depth[i] for i in sorted(depth)]
+
+
+def lab_x(x_ecal, layer, turn_deg, depths):
+    """Lab x of the beam that reaches x_ecal (ECAL frame) at the depth of layer (a float: the shower barycentre zbary),
+    ECAL turned by turn_deg about y around its centre: x_lab = cos(turn) x_ecal + sin(turn) depth."""
+    import math
+    z = float(np.interp(layer, range(len(depths)), depths))
+    t = math.radians(turn_deg)
+    return math.cos(t) * x_ecal + math.sin(t) * z
 
 
 def ecal_turn_deg(compact, geo=GEO):

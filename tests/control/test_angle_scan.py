@@ -16,7 +16,7 @@ import angle_geometry  # noqa: E402
 import collimator  # noqa: E402
 import collimator_prep  # noqa: E402
 from make_run_list import read_runs, run_name  # noqa: E402
-from siwecal_common.compact_geometry import ecal_turn_deg  # noqa: E402
+from siwecal_common.compact_geometry import ecal_turn_deg, lab_x  # noqa: E402
 
 
 @pytest.fixture
@@ -81,6 +81,18 @@ def test_only_turns_about_y(geo):
     det.write_text(det.read_text().replace('<rotation x="0"', '<rotation x="5*deg"'))
     with pytest.raises(ValueError):
         ecal_turn_deg(base, geo=str(geo))
+
+
+def test_lab_x_of_a_turned_ecal():
+    """Lab x of the beam from the ECAL-frame barycentre and its depth: what a straight line at lab x gives back."""
+    import math
+    depths = [-107.95 + 15 * i for i in range(15)]
+    t = math.radians(30)
+    for x_lab, layer in ((0.0, 5.0), (12.0, 2.5), (-20.0, 9.0)):
+        z = -107.95 + 15 * layer
+        x_ecal = (x_lab - math.sin(t) * z) / math.cos(t)    # the line x_lab, seen from the turned box
+        assert abs(lab_x(x_ecal, layer, 30.0, depths) - x_lab) < 1e-9
+    assert lab_x(33.0, 5.0, 0.0, depths) == 33.0
 
 
 def test_collimator_centre_in_the_lab():
