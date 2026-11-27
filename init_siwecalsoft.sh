@@ -69,8 +69,18 @@ fi
 _SWS_MSG=""
 if [ ! -d "${SIWECAL_PREFIX}" ]; then
     _SWS_MSG="no install/ yet: run ./build.sh"
-elif [ -d "${_SWS_ROOT}/build" ] && [ -n "$(find "${_SWS_ROOT}/build" -maxdepth 3 -name '*.so' -newer "${SIWECAL_PREFIX}" -print -quit 2>/dev/null)" ]; then
-    _SWS_MSG="build/ is newer than install/: run cmake --install build"
+else
+    # each built library against its installed copy (cmake --install keeps the time stamp). Not against the install/
+    # folder: its time stamp does not change when the files inside it are replaced, so that warned after every build.
+    for _so in "${_SWS_ROOT}"/build/*/lib*.so; do
+        [ -e "$_so" ] || continue
+        _inst="${SIWECAL_PREFIX}/lib64/${_so##*/}"
+        [ -e "$_inst" ] || _inst="${SIWECAL_PREFIX}/lib/${_so##*/}"
+        if [ ! -e "$_inst" ] || [ "$_so" -nt "$_inst" ]; then
+            _SWS_MSG="build/ is newer than install/ (${_so##*/}): run cmake --install build"
+            break
+        fi
+    done
 fi
 
 # ---- viewer venv -------------------------------------------------------------------------------------------------
@@ -83,5 +93,5 @@ if [ "$_SWS_QUIET" = 0 ]; then
     [ -n "${SIWECAL_CALIB_DIR:-}" ] && echo "[siwecal-soft] calibration: ${SIWECAL_CALIB_DIR}"
     [ -n "$_SWS_MSG" ] && echo "[siwecal-soft] WARNING: ${_SWS_MSG}" >&2
 fi
-unset _SWS_ROOT _SWS_VENV _SWS_QUIET _SWS_MSG _a _d
+unset _SWS_ROOT _SWS_VENV _SWS_QUIET _SWS_MSG _a _d _so _inst
 unset -f _sws_prepend
